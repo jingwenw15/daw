@@ -58,6 +58,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some("track") => run_track(args),
         Some("snapshot") => run_snapshot(args),
         Some("branch") => run_branch(args),
+        Some("vcs") => run_vcs(args),
         Some("history") => {
             let path = required_arg(&mut args, "path")?;
             no_extra_args(args)?;
@@ -81,6 +82,109 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some(command) => Err(format!(
             "unknown command: {command}\nrun `daw --help` for usage"
         )),
+    }
+}
+
+fn run_vcs(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    match args.next().as_deref() {
+        Some("init-git") => {
+            let path = required_arg(&mut args, "path")?;
+            no_extra_args(args)?;
+            daw_vcs::init_git(path.as_ref())
+                .map_err(|error| format!("failed to initialize Git: {error}"))?;
+            println!("initialized Git repository");
+            if daw_vcs::git_lfs_available(path.as_ref()) {
+                println!("Git LFS available; media file patterns written to .gitattributes");
+            } else {
+                println!("Git LFS not available; large media will remain regular Git files unless configured later");
+            }
+            Ok(())
+        }
+        Some("remote") => run_vcs_remote(args),
+        Some("status") => {
+            let path = required_arg(&mut args, "path")?;
+            no_extra_args(args)?;
+            let status = daw_vcs::status(path.as_ref())
+                .map_err(|error| format!("failed to read Git status: {error}"))?;
+            if !status.repository_exists {
+                println!("Git repository: not initialized");
+            } else if status.lines.is_empty() {
+                println!("Git repository: clean");
+            } else {
+                println!("Git repository: changes");
+                for line in status.lines {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        Some("commit") => {
+            let path = required_arg(&mut args, "path")?;
+            let message = required_arg(&mut args, "message")?;
+            no_extra_args(args)?;
+            daw_vcs::commit(path.as_ref(), &message)
+                .map_err(|error| format!("failed to commit project: {error}"))?;
+            println!("committed project changes");
+            Ok(())
+        }
+        Some("push") => {
+            let path = required_arg(&mut args, "path")?;
+            let remote = args.next().unwrap_or_else(|| "origin".to_owned());
+            let branch = args.next().map_or_else(|| current_git_branch(&path), Ok)?;
+            no_extra_args(args)?;
+            daw_vcs::push(path.as_ref(), &remote, &branch)
+                .map_err(|error| format!("failed to push project: {error}"))?;
+            println!("pushed {branch} to {remote}");
+            Ok(())
+        }
+        Some("pull") => {
+            let path = required_arg(&mut args, "path")?;
+            let remote = args.next().unwrap_or_else(|| "origin".to_owned());
+            let branch = args.next().map_or_else(|| current_git_branch(&path), Ok)?;
+            no_extra_args(args)?;
+            daw_vcs::pull(path.as_ref(), &remote, &branch)
+                .map_err(|error| format!("failed to pull project: {error}"))?;
+            println!("pulled {branch} from {remote}");
+            Ok(())
+        }
+        Some("lfs-status") => {
+            let path = required_arg(&mut args, "path")?;
+            no_extra_args(args)?;
+            if daw_vcs::git_lfs_available(path.as_ref()) {
+                println!("Git LFS: available");
+            } else {
+                println!("Git LFS: not available");
+            }
+            Ok(())
+        }
+        Some(command) => Err(format!(
+            "unknown vcs command: {command}\nrun `daw --help` for usage"
+        )),
+        None => Err("missing vcs command\nrun `daw --help` for usage".to_owned()),
+    }
+}
+
+fn current_git_branch(path: &str) -> Result<String, String> {
+    daw_vcs::current_branch(path.as_ref())
+        .map_err(|error| format!("failed to determine current Git branch: {error}"))
+}
+
+fn run_vcs_remote(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    match args.next().as_deref() {
+        Some("add") => {
+            let path = required_arg(&mut args, "path")?;
+            let name = required_arg(&mut args, "name")?;
+            let url = required_arg(&mut args, "url")?;
+            no_extra_args(args)?;
+            let remote = daw_vcs::add_remote(path.as_ref(), &name, &url)
+                .map_err(|error| format!("failed to configure remote: {error}"))?;
+            println!("configured remote '{}' -> {}", remote.name, remote.url);
+            Ok(())
+        }
+        Some(command) => Err(format!(
+            "unknown vcs remote command: {command}\nrun `daw --help` for usage"
+        )),
+        None => Err("missing vcs remote command\nrun `daw --help` for usage".to_owned()),
     }
 }
 
@@ -228,6 +332,13 @@ fn print_help() {
     println!("  daw branch create <path> <name>");
     println!("  daw branch list <path>");
     println!("  daw branch switch <path> <name>");
+    println!("  daw vcs init-git <path>");
+    println!("  daw vcs remote add <path> <name> <url>");
+    println!("  daw vcs status <path>");
+    println!("  daw vcs commit <path> <message>");
+    println!("  daw vcs push <path> [remote] [branch]");
+    println!("  daw vcs pull <path> [remote] [branch]");
+    println!("  daw vcs lfs-status <path>");
     println!("  daw diff <path> <left-ref> <right-ref>");
     println!("  daw merge <path> <source-branch>");
     println!("  daw history <path>");

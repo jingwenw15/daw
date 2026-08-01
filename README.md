@@ -45,3 +45,18 @@ cargo run --bin daw -- branch switch /tmp/my-session chorus
 cargo run --bin daw -- diff /tmp/my-session current branch:main
 cargo run --bin daw -- merge /tmp/my-session chorus
 ```
+
+## Stage 4
+
+Git integration is optional and uses system Git, so private SSH and HTTPS
+remotes rely on the user's existing Git credentials and macOS credential setup.
+
+```sh
+cargo run --bin daw -- vcs init-git /tmp/my-session
+cargo run --bin daw -- vcs remote add /tmp/my-session origin git@github.com:you/private-daw-project.git
+cargo run --bin daw -- vcs status /tmp/my-session
+cargo run --bin daw -- vcs commit /tmp/my-session "initial project"
+cargo run --bin daw -- vcs push /tmp/my-session origin main
+cargo run --bin daw -- vcs pull /tmp/my-session origin main
+cargo run --bin daw -- vcs lfs-status /tmp/my-session
+```
