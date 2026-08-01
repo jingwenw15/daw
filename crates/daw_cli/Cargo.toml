@@ -1,0 +1,19 @@
+[package]
+name = "daw_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "daw"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+daw_engine = { path = "../daw_engine" }
+daw_media = { path = "../daw_media" }
+daw_model = { path = "../daw_model" }
+daw_vcs = { path = "../daw_vcs" }
+serde_json = "1"
