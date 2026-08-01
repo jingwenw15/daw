@@ -60,3 +60,15 @@ cargo run --bin daw -- vcs push /tmp/my-session origin main
 cargo run --bin daw -- vcs pull /tmp/my-session origin main
 cargo run --bin daw -- vcs lfs-status /tmp/my-session
 ```
+
+## Stage 5
+
+Media import uses content-addressed SHA-256 storage plus a JSON media index.
+Waveform/cache data is disposable under `cache/`.
+
+```sh
+cargo run --bin daw -- media import /tmp/my-session /path/to/kick.wav
+cargo run --bin daw -- media list /tmp/my-session
+cargo run --bin daw -- media verify /tmp/my-session
+cargo run --bin daw -- media relink /tmp/my-session <hash> /path/to/replacement.wav
+```

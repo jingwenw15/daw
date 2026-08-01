@@ -59,6 +59,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some("snapshot") => run_snapshot(args),
         Some("branch") => run_branch(args),
         Some("vcs") => run_vcs(args),
+        Some("media") => run_media(args),
         Some("history") => {
             let path = required_arg(&mut args, "path")?;
             no_extra_args(args)?;
@@ -82,6 +83,69 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some(command) => Err(format!(
             "unknown command: {command}\nrun `daw --help` for usage"
         )),
+    }
+}
+
+fn run_media(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    match args.next().as_deref() {
+        Some("import") => {
+            let project = required_arg(&mut args, "path")?;
+            let source = required_arg(&mut args, "source")?;
+            no_extra_args(args)?;
+            let object = daw_media::import_media(project.as_ref(), source.as_ref())
+                .map_err(|error| format!("failed to import media: {error}"))?;
+            println!("imported media {}", object.hash);
+            println!("bytes: {}", object.byte_size);
+            println!("source: {}", object.original_path);
+            Ok(())
+        }
+        Some("list") => {
+            let project = required_arg(&mut args, "path")?;
+            no_extra_args(args)?;
+            let objects = daw_media::list_media(project.as_ref())
+                .map_err(|error| format!("failed to list media: {error}"))?;
+            if objects.is_empty() {
+                println!("media: none");
+            } else {
+                for object in objects {
+                    println!(
+                        "{} {} bytes {}",
+                        object.hash, object.byte_size, object.original_path
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some("verify") => {
+            let project = required_arg(&mut args, "path")?;
+            no_extra_args(args)?;
+            let results = daw_media::verify_media(project.as_ref())
+                .map_err(|error| format!("failed to verify media: {error}"))?;
+            if results.is_empty() {
+                println!("media: none");
+            } else {
+                for result in results {
+                    let status = if result.ok { "ok" } else { "missing" };
+                    println!("{} {} {}", status, result.hash, result.message);
+                }
+            }
+            Ok(())
+        }
+        Some("relink") => {
+            let project = required_arg(&mut args, "path")?;
+            let hash = required_arg(&mut args, "hash")?;
+            let replacement = required_arg(&mut args, "replacement")?;
+            no_extra_args(args)?;
+            let object = daw_media::relink_media(project.as_ref(), &hash, replacement.as_ref())
+                .map_err(|error| format!("failed to relink media: {error}"))?;
+            println!("relinked media {}", object.hash);
+            println!("source: {}", object.original_path);
+            Ok(())
+        }
+        Some(command) => Err(format!(
+            "unknown media command: {command}\nrun `daw --help` for usage"
+        )),
+        None => Err("missing media command\nrun `daw --help` for usage".to_owned()),
     }
 }
 
@@ -339,6 +403,10 @@ fn print_help() {
     println!("  daw vcs push <path> [remote] [branch]");
     println!("  daw vcs pull <path> [remote] [branch]");
     println!("  daw vcs lfs-status <path>");
+    println!("  daw media import <path> <source>");
+    println!("  daw media list <path>");
+    println!("  daw media verify <path>");
+    println!("  daw media relink <path> <hash> <replacement>");
     println!("  daw diff <path> <left-ref> <right-ref>");
     println!("  daw merge <path> <source-branch>");
     println!("  daw history <path>");
