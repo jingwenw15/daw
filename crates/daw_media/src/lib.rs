@@ -92,7 +92,7 @@ pub fn import_media(project_dir: &Path, source_path: &Path) -> Result<MediaObjec
     let bytes = fs::read(source_path)?;
     let hash = sha256_hex(&bytes);
     let extension = normalized_extension(source_path);
-    let object_path = object_path(project_dir, &hash, extension.as_deref());
+    let object_path = media_object_path(project_dir, &hash, extension.as_deref());
 
     if let Some(parent) = object_path.parent() {
         fs::create_dir_all(parent)?;
@@ -133,7 +133,7 @@ pub fn verify_media(project_dir: &Path) -> Result<Vec<MediaVerification>, MediaE
     let mut results = Vec::with_capacity(index.objects.len());
 
     for object in index.objects {
-        let path = object_path(project_dir, &object.hash, object.extension.as_deref());
+        let path = media_object_path(project_dir, &object.hash, object.extension.as_deref());
         if !path.exists() {
             results.push(MediaVerification {
                 hash: object.hash,
@@ -187,7 +187,7 @@ pub fn relink_media(
     }
 
     let extension = normalized_extension(replacement_path);
-    let path = object_path(project_dir, hash, extension.as_deref());
+    let path = media_object_path(project_dir, hash, extension.as_deref());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -266,7 +266,9 @@ fn save_index(project_dir: &Path, index: &MediaIndex) -> Result<(), MediaError> 
     Ok(())
 }
 
-fn object_path(project_dir: &Path, hash: &str, extension: Option<&str>) -> PathBuf {
+/// Return the content-addressed path for a media object.
+#[must_use]
+pub fn media_object_path(project_dir: &Path, hash: &str, extension: Option<&str>) -> PathBuf {
     let prefix = hash.get(0..2).unwrap_or("xx");
     let file_name = extension.map_or_else(
         || hash.to_owned(),

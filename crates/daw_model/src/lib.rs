@@ -57,6 +57,15 @@ pub struct Track {
     pub id: StableId,
     /// Human-readable track name.
     pub name: String,
+    /// Linear volume percentage, where 100 is unity gain.
+    #[serde(default = "default_track_volume_percent")]
+    pub volume_percent: u16,
+    /// True when this track should be silent.
+    #[serde(default)]
+    pub muted: bool,
+    /// True when this track is soloed.
+    #[serde(default)]
+    pub solo: bool,
     /// Clips placed on this track.
     pub clips: Vec<Clip>,
 }
@@ -97,6 +106,18 @@ pub enum ProjectCommand {
     AddTrack {
         /// Track to append.
         track: Track,
+    },
+    /// Add or update a media reference.
+    AddMediaReference {
+        /// Media reference to store.
+        media: MediaReference,
+    },
+    /// Add a clip to an existing track.
+    AddClip {
+        /// Track receiving the clip.
+        track_id: StableId,
+        /// Clip to append.
+        clip: Clip,
     },
     /// Replace current state with a stored snapshot.
     CheckoutSnapshot {
@@ -265,6 +286,9 @@ impl Track {
         Self {
             id: StableId::new(),
             name: name.into(),
+            volume_percent: default_track_volume_percent(),
+            muted: false,
+            solo: false,
             clips: Vec::new(),
         }
     }
@@ -309,6 +333,15 @@ impl ProjectCommand {
     fn summary(&self) -> String {
         match self {
             Self::AddTrack { track } => format!("add track '{}'", track.name),
+            Self::AddMediaReference { media } => {
+                format!(
+                    "add media {}",
+                    media.content_hash.as_deref().unwrap_or("unknown")
+                )
+            }
+            Self::AddClip { track_id, clip } => {
+                format!("add clip {} to track {track_id}", clip.id)
+            }
             Self::CheckoutSnapshot { snapshot_id } => {
                 format!("checkout snapshot {snapshot_id}")
             }
@@ -537,6 +570,59 @@ pub fn add_track(project_dir: &Path, name: &str) -> Result<Track, ProjectIoError
     Ok(track)
 }
 
+/// Add or update a media reference through the command log.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded or updated.
+pub fn add_media_reference(
+    project_dir: &Path,
+    content_hash: &str,
+    original_path: Option<String>,
+) -> Result<MediaReference, ProjectIoError> {
+    let media = MediaReference {
+        id: StableId::from_string(content_hash),
+        content_hash: Some(content_hash.to_owned()),
+        original_path,
+    };
+    append_and_apply(
+        project_dir,
+        ProjectCommand::AddMediaReference {
+            media: media.clone(),
+        },
+    )?;
+    Ok(media)
+}
+
+/// Add a timeline clip to a track.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the track/media reference
+/// is unknown, or the updated project cannot be saved.
+pub fn add_clip(
+    project_dir: &Path,
+    track_id: &StableId,
+    media_id: &StableId,
+    start_sample: u64,
+    duration_samples: u64,
+) -> Result<Clip, ProjectIoError> {
+    let clip = Clip {
+        id: StableId::new(),
+        media_id: media_id.clone(),
+        start_sample,
+        duration_samples,
+    };
+    append_and_apply(
+        project_dir,
+        ProjectCommand::AddClip {
+            track_id: track_id.clone(),
+            clip: clip.clone(),
+        },
+    )?;
+    Ok(clip)
+}
+
 /// Create a branch from the current project state.
 ///
 /// # Errors
@@ -757,6 +843,47 @@ fn apply_command(
                 Err(ProjectIoError::Invalid(errors))
             }
         }
+        ProjectCommand::AddMediaReference { media } => {
+            if let Some(existing) = project
+                .media
+                .iter_mut()
+                .find(|existing| existing.id == media.id)
+            {
+                *existing = media.clone();
+            } else {
+                project.media.push(media.clone());
+            }
+            let errors = project.validate();
+            if errors.is_empty() {
+                Ok(project)
+            } else {
+                Err(ProjectIoError::Invalid(errors))
+            }
+        }
+        ProjectCommand::AddClip { track_id, clip } => {
+            if !project.media.iter().any(|media| media.id == clip.media_id) {
+                return Err(ProjectIoError::Invalid(vec![ValidationError::new(
+                    format!("unknown media id {}", clip.media_id),
+                )]));
+            }
+            let track = project
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == *track_id)
+                .ok_or_else(|| {
+                    ProjectIoError::Invalid(vec![ValidationError::new(format!(
+                        "unknown track id {track_id}"
+                    ))])
+                })?;
+            track.clips.push(clip.clone());
+            track.clips.sort_by_key(|clip| clip.start_sample);
+            let errors = project.validate();
+            if errors.is_empty() {
+                Ok(project)
+            } else {
+                Err(ProjectIoError::Invalid(errors))
+            }
+        }
         ProjectCommand::CheckoutSnapshot { snapshot_id } => {
             Ok(load_snapshot(project_dir, snapshot_id)?.project)
         }
@@ -908,12 +1035,17 @@ fn unix_timestamp_millis() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
+fn default_track_volume_percent() -> u16 {
+    100
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        add_track, checkout_snapshot, create_branch, create_snapshot, diff, init_project,
-        list_branches, load_project, merge_branch, project_file_path, replay_project,
-        switch_branch, Project, ProjectIoError, StableId, Track, PROJECT_SCHEMA_VERSION,
+        add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
+        create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
+        project_file_path, replay_project, switch_branch, Project, ProjectIoError, StableId, Track,
+        PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -931,6 +1063,9 @@ mod tests {
             tracks: vec![Track {
                 id: StableId::from_string("track-id"),
                 name: "Drums".to_owned(),
+                volume_percent: 100,
+                muted: false,
+                solo: false,
                 clips: Vec::new(),
             }],
             media: Vec::new(),
@@ -940,7 +1075,7 @@ mod tests {
 
         assert_eq!(
             json,
-            "{\n  \"schema_version\": 1,\n  \"id\": \"project-id\",\n  \"name\": \"Session\",\n  \"tracks\": [\n    {\n      \"id\": \"track-id\",\n      \"name\": \"Drums\",\n      \"clips\": []\n    }\n  ],\n  \"media\": []\n}\n"
+            "{\n  \"schema_version\": 1,\n  \"id\": \"project-id\",\n  \"name\": \"Session\",\n  \"tracks\": [\n    {\n      \"id\": \"track-id\",\n      \"name\": \"Drums\",\n      \"volume_percent\": 100,\n      \"muted\": false,\n      \"solo\": false,\n      \"clips\": []\n    }\n  ],\n  \"media\": []\n}\n"
         );
     }
 
@@ -955,11 +1090,17 @@ mod tests {
                 Track {
                     id: duplicate_id.clone(),
                     name: "A".to_owned(),
+                    volume_percent: 100,
+                    muted: false,
+                    solo: false,
                     clips: Vec::new(),
                 },
                 Track {
                     id: duplicate_id,
                     name: "B".to_owned(),
+                    volume_percent: 100,
+                    muted: false,
+                    solo: false,
                     clips: Vec::new(),
                 },
             ],
@@ -1026,6 +1167,25 @@ mod tests {
         assert_eq!(restored.tracks.len(), 1);
         assert_eq!(restored.tracks[0].name, "Original");
         assert_eq!(loaded, restored);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn adds_media_reference_and_clip_through_command_log() {
+        let project_dir = temp_project_dir("clip");
+        init_project(&project_dir, "Clips").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(project.media, vec![media]);
+        assert_eq!(project.tracks[0].clips, vec![clip]);
+        assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");
     }

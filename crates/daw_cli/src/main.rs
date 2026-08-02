@@ -56,12 +56,14 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             )
         }
         Some("track") => run_track(args),
+        Some("clip") => run_clip(args),
         Some("snapshot") => run_snapshot(args),
         Some("branch") => run_branch(args),
         Some("vcs") => run_vcs(args),
         Some("media") => run_media(args),
         Some("render-test-tone") => run_render_test_tone(args),
         Some("render-project") => run_render_project(args),
+        Some("play-project") => run_play_project(args),
         Some("play-test-tone") => run_play_test_tone(args),
         Some("history") => {
             let path = required_arg(&mut args, "path")?;
@@ -102,6 +104,22 @@ fn run_play_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), Stri
     Ok(())
 }
 
+fn run_play_project(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let project_path = required_arg(&mut args, "path")?;
+    let duration = optional_f32(args.next(), 1.0, "minimum-duration-seconds")?;
+    no_extra_args(args)?;
+    let buffer = render_project_buffer(&project_path, duration)?;
+    let hold_seconds = frames_to_seconds(buffer.frames(), buffer.sample_rate) + 0.10;
+    let report = daw_engine::play_buffer(buffer, hold_seconds)
+        .map_err(|error| format!("failed to play project: {error}"))?;
+    println!("played project on '{}'", report.device_name);
+    println!(
+        "{} frames at {} Hz, {} channels, stream errors: {}",
+        report.frames_played, report.sample_rate, report.channels, report.stream_errors
+    );
+    Ok(())
+}
+
 fn run_render_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let output = required_arg(&mut args, "output")?;
     let duration = optional_f32(args.next(), 1.0, "duration-seconds")?;
@@ -130,18 +148,11 @@ fn run_render_project(mut args: impl Iterator<Item = String>) -> Result<(), Stri
     let output = required_arg(&mut args, "output")?;
     let duration = optional_f32(args.next(), 1.0, "duration-seconds")?;
     no_extra_args(args)?;
-    daw_model::load_project(project_path.as_ref())
-        .map_err(|error| format!("project is invalid: {error}"))?;
-    let buffer = daw_engine::render_silence(
-        duration,
-        daw_engine::DEFAULT_SAMPLE_RATE,
-        daw_engine::DEFAULT_CHANNELS,
-    )
-    .map_err(|error| format!("failed to render project: {error}"))?;
+    let buffer = render_project_buffer(&project_path, duration)?;
     daw_engine::write_wav(output.as_ref(), &buffer)
         .map_err(|error| format!("failed to write project render: {error}"))?;
     println!(
-        "rendered project placeholder: {} frames at {} Hz -> {}",
+        "rendered project: {} frames at {} Hz -> {}",
         buffer.frames(),
         buffer.sample_rate,
         output
@@ -157,7 +168,14 @@ fn run_media(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             no_extra_args(args)?;
             let object = daw_media::import_media(project.as_ref(), source.as_ref())
                 .map_err(|error| format!("failed to import media: {error}"))?;
+            let media = daw_model::add_media_reference(
+                project.as_ref(),
+                &object.hash,
+                Some(object.original_path.clone()),
+            )
+            .map_err(|error| format!("failed to register media in project: {error}"))?;
             println!("imported media {}", object.hash);
+            println!("media id: {}", media.id);
             println!("bytes: {}", object.byte_size);
             println!("source: {}", object.original_path);
             Ok(())
@@ -209,6 +227,33 @@ fn run_media(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "unknown media command: {command}\nrun `daw --help` for usage"
         )),
         None => Err("missing media command\nrun `daw --help` for usage".to_owned()),
+    }
+}
+
+fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    match args.next().as_deref() {
+        Some("add") => {
+            let project = required_arg(&mut args, "path")?;
+            let track_id = required_arg(&mut args, "track-id")?;
+            let media_id = required_arg(&mut args, "media-id")?;
+            let start_sample = required_u64(&mut args, "start-sample")?;
+            let duration_samples = required_u64(&mut args, "duration-samples")?;
+            no_extra_args(args)?;
+            let clip = daw_model::add_clip(
+                project.as_ref(),
+                &daw_model::StableId::from_string(track_id),
+                &daw_model::StableId::from_string(media_id),
+                start_sample,
+                duration_samples,
+            )
+            .map_err(|error| format!("failed to add clip: {error}"))?;
+            println!("added clip {}", clip.id);
+            Ok(())
+        }
+        Some(command) => Err(format!(
+            "unknown clip command: {command}\nrun `daw --help` for usage"
+        )),
+        None => Err("missing clip command\nrun `daw --help` for usage".to_owned()),
     }
 }
 
@@ -445,6 +490,95 @@ fn print_named_list(label: &str, values: &[String]) {
     }
 }
 
+fn render_project_buffer(
+    project_path: &str,
+    minimum_duration: f32,
+) -> Result<daw_engine::AudioBuffer, String> {
+    let project = daw_model::load_project(project_path.as_ref())
+        .map_err(|error| format!("project is invalid: {error}"))?;
+    let media_objects = daw_media::list_media(project_path.as_ref())
+        .map_err(|error| format!("failed to list media: {error}"))?;
+    let mut total_frames = duration_to_frames(minimum_duration, daw_engine::DEFAULT_SAMPLE_RATE)?;
+    for track in &project.tracks {
+        for clip in &track.clips {
+            let clip_end = usize::try_from(clip.start_sample.saturating_add(clip.duration_samples))
+                .map_err(|_| "clip timeline position is too large".to_owned())?;
+            total_frames = total_frames.max(clip_end);
+        }
+    }
+
+    let mut output = daw_engine::AudioBuffer {
+        sample_rate: daw_engine::DEFAULT_SAMPLE_RATE,
+        channels: daw_engine::DEFAULT_CHANNELS,
+        samples: vec![0.0; total_frames * usize::from(daw_engine::DEFAULT_CHANNELS)],
+    };
+    let solo_active = project.tracks.iter().any(|track| track.solo);
+
+    for track in &project.tracks {
+        if track.muted || (solo_active && !track.solo) {
+            continue;
+        }
+        for clip in &track.clips {
+            let media = project
+                .media
+                .iter()
+                .find(|media| media.id == clip.media_id)
+                .ok_or_else(|| {
+                    format!(
+                        "clip {} references unknown media {}",
+                        clip.id, clip.media_id
+                    )
+                })?;
+            let hash = media
+                .content_hash
+                .as_deref()
+                .ok_or_else(|| format!("media {} has no content hash", media.id))?;
+            let object = media_objects
+                .iter()
+                .find(|object| object.hash == hash)
+                .ok_or_else(|| format!("media hash {hash} is not imported"))?;
+            let path = daw_media::media_object_path(
+                project_path.as_ref(),
+                &object.hash,
+                object.extension.as_deref(),
+            );
+            let decoded = daw_engine::read_wav(&path)
+                .map_err(|error| format!("failed to read media {hash}: {error}"))?;
+            if decoded.sample_rate != output.sample_rate || decoded.channels != output.channels {
+                return Err(format!(
+                    "media {hash} is {} Hz/{} channels; expected {} Hz/{} channels",
+                    decoded.sample_rate, decoded.channels, output.sample_rate, output.channels
+                ));
+            }
+            let limited = limit_buffer_frames(
+                &decoded,
+                usize::try_from(clip.duration_samples)
+                    .map_err(|_| "clip duration is too large".to_owned())?,
+            );
+            daw_engine::mix_clip(
+                &mut output,
+                &limited,
+                usize::try_from(clip.start_sample)
+                    .map_err(|_| "clip start is too large".to_owned())?,
+                track.volume_percent,
+                track.muted,
+            );
+        }
+    }
+
+    Ok(output)
+}
+
+fn limit_buffer_frames(buffer: &daw_engine::AudioBuffer, frames: usize) -> daw_engine::AudioBuffer {
+    let channels = usize::from(buffer.channels);
+    let sample_count = buffer.samples.len().min(frames.saturating_mul(channels));
+    daw_engine::AudioBuffer {
+        sample_rate: buffer.sample_rate,
+        channels: buffer.channels,
+        samples: buffer.samples[..sample_count].to_vec(),
+    }
+}
+
 fn print_help() {
     println!("daw {VERSION}");
     println!();
@@ -455,6 +589,7 @@ fn print_help() {
     println!("  daw validate <path>");
     println!("  daw inspect <path>");
     println!("  daw track add <path> <name>");
+    println!("  daw clip add <path> <track-id> <media-id> <start-sample> <duration-samples>");
     println!("  daw snapshot create <path> [message]");
     println!("  daw branch create <path> <name>");
     println!("  daw branch list <path>");
@@ -473,6 +608,7 @@ fn print_help() {
     println!("  daw render-test-tone <output> [duration-seconds]");
     println!("  daw render-project <path> <output> [duration-seconds]");
     println!("  daw play-test-tone [duration-seconds]");
+    println!("  daw play-project <path> [minimum-duration-seconds]");
     println!("  daw diff <path> <left-ref> <right-ref>");
     println!("  daw merge <path> <source-branch>");
     println!("  daw history <path>");
@@ -491,6 +627,25 @@ fn optional_f32(value: Option<String>, default: f32, name: &str) -> Result<f32, 
             .parse::<f32>()
             .map_err(|error| format!("invalid {name}: {error}"))
     })
+}
+
+fn required_u64(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u64, String> {
+    required_arg(args, name)?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {name}: {error}"))
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn frames_to_seconds(frames: usize, sample_rate: u32) -> f32 {
+    (frames as f32 / sample_rate as f32).max(0.0)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn duration_to_frames(duration: f32, sample_rate: u32) -> Result<usize, String> {
+    if duration <= 0.0 {
+        return Err("duration must be greater than zero".to_owned());
+    }
+    Ok((f64::from(duration) * f64::from(sample_rate)).round() as usize)
 }
 
 fn no_extra_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {

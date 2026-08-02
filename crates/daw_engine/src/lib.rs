@@ -41,6 +41,8 @@ pub enum RenderError {
     Io(io::Error),
     /// Render settings are invalid.
     InvalidSettings(String),
+    /// WAV file is unsupported or malformed.
+    UnsupportedWav(String),
 }
 
 /// Summary returned by a real-time playback smoke run.
@@ -123,6 +125,29 @@ pub fn play_test_tone(duration_seconds: f32) -> Result<PlaybackReport, PlaybackE
     let device = host
         .default_output_device()
         .ok_or(PlaybackError::NoOutputDevice)?;
+    let supported_config = device
+        .default_output_config()
+        .map_err(|error| PlaybackError::DefaultConfig(error.to_string()))?;
+    let sample_rate = supported_config.sample_rate().0;
+    let channels = supported_config.channels();
+    let buffer = render_sine(440.0, duration_seconds, 0.20, sample_rate, channels)?;
+    play_buffer(buffer, duration_seconds + 0.10)
+}
+
+/// Play a rendered buffer through the default output device.
+///
+/// # Errors
+///
+/// Returns an error if no output device exists, the stream cannot be built, or
+/// the stream cannot be started.
+pub fn play_buffer(
+    buffer: AudioBuffer,
+    hold_seconds: f32,
+) -> Result<PlaybackReport, PlaybackError> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or(PlaybackError::NoOutputDevice)?;
     let device_name = device
         .name()
         .unwrap_or_else(|_| "default output".to_owned());
@@ -131,13 +156,7 @@ pub fn play_test_tone(duration_seconds: f32) -> Result<PlaybackReport, PlaybackE
         .map_err(|error| PlaybackError::DefaultConfig(error.to_string()))?;
     let sample_rate = supported_config.sample_rate().0;
     let channels = supported_config.channels();
-    let buffer = Arc::new(render_sine(
-        440.0,
-        duration_seconds,
-        0.20,
-        sample_rate,
-        channels,
-    )?);
+    let buffer = Arc::new(buffer);
     let next_sample = Arc::new(AtomicUsize::new(0));
     let stream_errors = Arc::new(AtomicU32::new(0));
     let stream_config = supported_config.config();
@@ -172,7 +191,7 @@ pub fn play_test_tone(duration_seconds: f32) -> Result<PlaybackReport, PlaybackE
     stream
         .play()
         .map_err(|error| PlaybackError::PlayStream(error.to_string()))?;
-    thread::sleep(Duration::from_secs_f32(duration_seconds + 0.10));
+    thread::sleep(Duration::from_secs_f32(hold_seconds));
     drop(stream);
 
     Ok(PlaybackReport {
@@ -182,6 +201,46 @@ pub fn play_test_tone(duration_seconds: f32) -> Result<PlaybackReport, PlaybackE
         frames_played: next_sample.load(Ordering::Relaxed) / usize::from(channels),
         stream_errors: stream_errors.load(Ordering::Relaxed),
     })
+}
+
+/// Read a 16-bit PCM WAV file into an audio buffer.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or is not supported PCM WAV.
+pub fn read_wav(path: &Path) -> Result<AudioBuffer, RenderError> {
+    let bytes = fs::read(path)?;
+    parse_pcm16_wav(&bytes)
+}
+
+/// Mix a clip buffer into a destination at a start frame.
+pub fn mix_clip(
+    destination: &mut AudioBuffer,
+    clip: &AudioBuffer,
+    start_frame: usize,
+    volume_percent: u16,
+    muted: bool,
+) {
+    if muted || destination.channels != clip.channels || destination.sample_rate != clip.sample_rate
+    {
+        return;
+    }
+
+    let destination_channels = usize::from(destination.channels);
+    let gain = f32::from(volume_percent) / 100.0;
+    for clip_frame in 0..clip.frames() {
+        let destination_frame = start_frame + clip_frame;
+        if destination_frame >= destination.frames() {
+            break;
+        }
+        for channel in 0..destination_channels {
+            let destination_index = destination_frame * destination_channels + channel;
+            let clip_index = clip_frame * destination_channels + channel;
+            destination.samples[destination_index] = (destination.samples[destination_index]
+                + clip.samples[clip_index] * gain)
+                .clamp(-1.0, 1.0);
+        }
+    }
 }
 
 /// Render silence for a minimal project render placeholder.
@@ -272,7 +331,9 @@ impl fmt::Display for RenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
-            Self::InvalidSettings(message) => formatter.write_str(message),
+            Self::InvalidSettings(message) | Self::UnsupportedWav(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -311,7 +372,7 @@ impl std::error::Error for RenderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidSettings(_) => None,
+            Self::InvalidSettings(_) | Self::UnsupportedWav(_) => None,
         }
     }
 }
@@ -413,9 +474,100 @@ where
     }
 }
 
+fn parse_pcm16_wav(bytes: &[u8]) -> Result<AudioBuffer, RenderError> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(RenderError::UnsupportedWav(
+            "expected RIFF/WAVE file".to_owned(),
+        ));
+    }
+
+    let mut cursor = 12;
+    let mut channels = None;
+    let mut sample_rate = None;
+    let mut bits_per_sample = None;
+    let mut audio_format = None;
+    let mut data = None;
+
+    while cursor + 8 <= bytes.len() {
+        let id = &bytes[cursor..cursor + 4];
+        let size = u32::from_le_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]);
+        cursor += 8;
+        let chunk_size = usize::try_from(size)
+            .map_err(|_| RenderError::UnsupportedWav("WAV chunk is too large".to_owned()))?;
+        if cursor + chunk_size > bytes.len() {
+            return Err(RenderError::UnsupportedWav(
+                "WAV chunk extends past end of file".to_owned(),
+            ));
+        }
+        match id {
+            b"fmt " => {
+                if chunk_size < 16 {
+                    return Err(RenderError::UnsupportedWav(
+                        "WAV fmt chunk is too short".to_owned(),
+                    ));
+                }
+                audio_format = Some(u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]));
+                channels = Some(u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]));
+                sample_rate = Some(u32::from_le_bytes([
+                    bytes[cursor + 4],
+                    bytes[cursor + 5],
+                    bytes[cursor + 6],
+                    bytes[cursor + 7],
+                ]));
+                bits_per_sample =
+                    Some(u16::from_le_bytes([bytes[cursor + 14], bytes[cursor + 15]]));
+            }
+            b"data" => {
+                data = Some(&bytes[cursor..cursor + chunk_size]);
+            }
+            _ => {}
+        }
+        cursor += chunk_size + (chunk_size % 2);
+    }
+
+    if audio_format != Some(1) || bits_per_sample != Some(16) {
+        return Err(RenderError::UnsupportedWav(
+            "only 16-bit PCM WAV files are supported".to_owned(),
+        ));
+    }
+
+    let channels = channels.ok_or_else(|| {
+        RenderError::UnsupportedWav("WAV file is missing channel count".to_owned())
+    })?;
+    let sample_rate = sample_rate
+        .ok_or_else(|| RenderError::UnsupportedWav("WAV file is missing sample rate".to_owned()))?;
+    let data =
+        data.ok_or_else(|| RenderError::UnsupportedWav("WAV file is missing data".to_owned()))?;
+    if data.len() % 2 != 0 {
+        return Err(RenderError::UnsupportedWav(
+            "WAV data length must be even for PCM16".to_owned(),
+        ));
+    }
+
+    let mut samples = Vec::with_capacity(data.len() / 2);
+    for chunk in data.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        samples.push(f32::from(sample) / f32::from(i16::MAX));
+    }
+
+    Ok(AudioBuffer {
+        sample_rate,
+        channels,
+        samples,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{render_silence, render_sine, write_wav, DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE};
+    use super::{
+        mix_clip, read_wav, render_silence, render_sine, write_wav, AudioBuffer, DEFAULT_CHANNELS,
+        DEFAULT_SAMPLE_RATE,
+    };
     use std::{fs, path::PathBuf};
 
     #[test]
@@ -458,6 +610,26 @@ mod tests {
         assert_eq!(&bytes[8..12], b"WAVE");
         assert_eq!(&bytes[12..16], b"fmt ");
         assert_eq!(&bytes[36..40], b"data");
+        fs::remove_file(output).expect("cleanup");
+    }
+
+    #[test]
+    fn reads_written_wav_and_mixes_clip() {
+        let output = temp_file("read-mix.wav");
+        let clip = render_sine(440.0, 0.01, 0.25, DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS)
+            .expect("render sine");
+        write_wav(&output, &clip).expect("write wav");
+
+        let decoded = read_wav(&output).expect("read wav");
+        let mut destination = AudioBuffer {
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            channels: DEFAULT_CHANNELS,
+            samples: vec![0.0; decoded.samples.len() + 100],
+        };
+        mix_clip(&mut destination, &decoded, 10, 100, false);
+
+        assert_eq!(decoded.frames(), clip.frames());
+        assert!(destination.samples.iter().any(|sample| sample.abs() > 0.0));
         fs::remove_file(output).expect("cleanup");
     }
 

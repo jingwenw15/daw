@@ -92,3 +92,15 @@ uses CoreAudio through the engine backend.
 ```sh
 cargo run --bin daw -- play-test-tone 1.0
 ```
+
+## Stage 8
+
+Projects can place imported 16-bit PCM WAV media on tracks and render/play the
+timeline. Timeline positions are sample-frame based at the engine render rate.
+
+```sh
+cargo run --bin daw -- media import /tmp/my-session /tmp/test-tone.wav
+cargo run --bin daw -- clip add /tmp/my-session <track-id> <media-id> 0 48000
+cargo run --bin daw -- render-project /tmp/my-session /tmp/timeline.wav 1.0
+cargo run --bin daw -- play-project /tmp/my-session 1.0
+```
