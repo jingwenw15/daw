@@ -1,6 +1,18 @@
 //! Real-time audio engine primitives.
 
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    FromSample, Sample,
+};
 use std::{f64::consts::TAU, fmt, fs, io, path::Path};
+use std::{
+    sync::{
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 /// Crate version exposed for smoke tests and diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,6 +41,36 @@ pub enum RenderError {
     Io(io::Error),
     /// Render settings are invalid.
     InvalidSettings(String),
+}
+
+/// Summary returned by a real-time playback smoke run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaybackReport {
+    /// Output device name.
+    pub device_name: String,
+    /// Stream sample rate.
+    pub sample_rate: u32,
+    /// Stream channel count.
+    pub channels: u16,
+    /// Frames rendered by the callback.
+    pub frames_played: usize,
+    /// Stream error callback count.
+    pub stream_errors: u32,
+}
+
+/// Error returned by real-time playback.
+#[derive(Debug)]
+pub enum PlaybackError {
+    /// No default output device is available.
+    NoOutputDevice,
+    /// Backend failed to provide a default stream config.
+    DefaultConfig(String),
+    /// Backend failed to build the stream.
+    BuildStream(String),
+    /// Backend failed to start the stream.
+    PlayStream(String),
+    /// Render settings are invalid.
+    Render(RenderError),
 }
 
 /// Render a deterministic sine test tone.
@@ -67,6 +109,78 @@ pub fn render_sine(
         sample_rate,
         channels,
         samples,
+    })
+}
+
+/// Play a short sine test tone through the default output device.
+///
+/// # Errors
+///
+/// Returns an error if no output device exists, the stream cannot be built, or
+/// the stream cannot be started.
+pub fn play_test_tone(duration_seconds: f32) -> Result<PlaybackReport, PlaybackError> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or(PlaybackError::NoOutputDevice)?;
+    let device_name = device
+        .name()
+        .unwrap_or_else(|_| "default output".to_owned());
+    let supported_config = device
+        .default_output_config()
+        .map_err(|error| PlaybackError::DefaultConfig(error.to_string()))?;
+    let sample_rate = supported_config.sample_rate().0;
+    let channels = supported_config.channels();
+    let buffer = Arc::new(render_sine(
+        440.0,
+        duration_seconds,
+        0.20,
+        sample_rate,
+        channels,
+    )?);
+    let next_sample = Arc::new(AtomicUsize::new(0));
+    let stream_errors = Arc::new(AtomicU32::new(0));
+    let stream_config = supported_config.config();
+
+    let stream = match supported_config.sample_format() {
+        cpal::SampleFormat::F32 => build_test_tone_stream::<f32>(
+            &device,
+            &stream_config,
+            Arc::clone(&buffer),
+            Arc::clone(&next_sample),
+            &stream_errors,
+        ),
+        cpal::SampleFormat::I16 => build_test_tone_stream::<i16>(
+            &device,
+            &stream_config,
+            Arc::clone(&buffer),
+            Arc::clone(&next_sample),
+            &stream_errors,
+        ),
+        cpal::SampleFormat::U16 => build_test_tone_stream::<u16>(
+            &device,
+            &stream_config,
+            Arc::clone(&buffer),
+            Arc::clone(&next_sample),
+            &stream_errors,
+        ),
+        format => Err(PlaybackError::BuildStream(format!(
+            "unsupported sample format: {format:?}"
+        ))),
+    }?;
+
+    stream
+        .play()
+        .map_err(|error| PlaybackError::PlayStream(error.to_string()))?;
+    thread::sleep(Duration::from_secs_f32(duration_seconds + 0.10));
+    drop(stream);
+
+    Ok(PlaybackReport {
+        device_name,
+        sample_rate,
+        channels,
+        frames_played: next_sample.load(Ordering::Relaxed) / usize::from(channels),
+        stream_errors: stream_errors.load(Ordering::Relaxed),
     })
 }
 
@@ -163,6 +277,36 @@ impl fmt::Display for RenderError {
     }
 }
 
+impl fmt::Display for PlaybackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoOutputDevice => formatter.write_str("no default output device available"),
+            Self::DefaultConfig(message)
+            | Self::BuildStream(message)
+            | Self::PlayStream(message) => formatter.write_str(message),
+            Self::Render(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PlaybackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Render(error) => Some(error),
+            Self::NoOutputDevice
+            | Self::DefaultConfig(_)
+            | Self::BuildStream(_)
+            | Self::PlayStream(_) => None,
+        }
+    }
+}
+
+impl From<RenderError> for PlaybackError {
+    fn from(error: RenderError) -> Self {
+        Self::Render(error)
+    }
+}
+
 impl std::error::Error for RenderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -233,6 +377,40 @@ fn sample_to_f32(sample: f64) -> f32 {
 fn sample_to_i16(sample: f32) -> i16 {
     let pcm = f64::from(sample.clamp(-1.0, 1.0)) * f64::from(i16::MAX);
     pcm.round() as i16
+}
+
+fn build_test_tone_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    buffer: Arc<AudioBuffer>,
+    next_sample: Arc<AtomicUsize>,
+    stream_errors: &Arc<AtomicU32>,
+) -> Result<cpal::Stream, PlaybackError>
+where
+    T: Sample + FromSample<f32> + cpal::SizedSample,
+{
+    let error_counter = Arc::clone(stream_errors);
+    device
+        .build_output_stream(
+            config,
+            move |output: &mut [T], _| write_playback_data(output, &buffer, &next_sample),
+            move |_| {
+                error_counter.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        )
+        .map_err(|error| PlaybackError::BuildStream(error.to_string()))
+}
+
+fn write_playback_data<T>(output: &mut [T], buffer: &AudioBuffer, next_sample: &AtomicUsize)
+where
+    T: Sample + FromSample<f32>,
+{
+    for sample in output {
+        let index = next_sample.fetch_add(1, Ordering::Relaxed);
+        let value = buffer.samples.get(index).copied().unwrap_or(0.0);
+        *sample = T::from_sample(value);
+    }
 }
 
 #[cfg(test)]

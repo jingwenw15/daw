@@ -83,3 +83,12 @@ project and writes a silent placeholder render until timeline clips are added.
 cargo run --bin daw -- render-test-tone /tmp/test-tone.wav 1.0
 cargo run --bin daw -- render-project /tmp/my-session /tmp/project-render.wav 1.0
 ```
+
+## Stage 7
+
+The default output device can play a short real-time test tone. On macOS this
+uses CoreAudio through the engine backend.
+
+```sh
+cargo run --bin daw -- play-test-tone 1.0
+```

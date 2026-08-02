@@ -62,6 +62,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some("media") => run_media(args),
         Some("render-test-tone") => run_render_test_tone(args),
         Some("render-project") => run_render_project(args),
+        Some("play-test-tone") => run_play_test_tone(args),
         Some("history") => {
             let path = required_arg(&mut args, "path")?;
             no_extra_args(args)?;
@@ -86,6 +87,19 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             "unknown command: {command}\nrun `daw --help` for usage"
         )),
     }
+}
+
+fn run_play_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let duration = optional_f32(args.next(), 1.0, "duration-seconds")?;
+    no_extra_args(args)?;
+    let report = daw_engine::play_test_tone(duration)
+        .map_err(|error| format!("failed to play test tone: {error}"))?;
+    println!("played test tone on '{}'", report.device_name);
+    println!(
+        "{} frames at {} Hz, {} channels, stream errors: {}",
+        report.frames_played, report.sample_rate, report.channels, report.stream_errors
+    );
+    Ok(())
 }
 
 fn run_render_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -458,6 +472,7 @@ fn print_help() {
     println!("  daw media relink <path> <hash> <replacement>");
     println!("  daw render-test-tone <output> [duration-seconds]");
     println!("  daw render-project <path> <output> [duration-seconds]");
+    println!("  daw play-test-tone [duration-seconds]");
     println!("  daw diff <path> <left-ref> <right-ref>");
     println!("  daw merge <path> <source-branch>");
     println!("  daw history <path>");
