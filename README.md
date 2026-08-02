@@ -104,3 +104,13 @@ cargo run --bin daw -- clip add /tmp/my-session <track-id> <media-id> 0 48000
 cargo run --bin daw -- render-project /tmp/my-session /tmp/timeline.wav 1.0
 cargo run --bin daw -- play-project /tmp/my-session 1.0
 ```
+
+## Stage 9
+
+A minimal native UI shell can create/open projects, add tracks, create
+snapshots, inspect tracks/media/history, validate the project, and trigger a
+short playback smoke tone.
+
+```sh
+cargo run --bin daw-ui
+```

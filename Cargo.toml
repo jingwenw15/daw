@@ -4,6 +4,7 @@ members = [
     "crates/daw_engine",
     "crates/daw_media",
     "crates/daw_model",
+    "crates/daw_ui",
     "crates/daw_vcs",
 ]
 resolver = "2"

@@ -1,0 +1,18 @@
+[package]
+name = "daw_ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "daw-ui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+daw_engine = { path = "../daw_engine" }
+daw_media = { path = "../daw_media" }
+daw_model = { path = "../daw_model" }
+eframe = "0.33"
