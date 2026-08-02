@@ -60,6 +60,8 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some("branch") => run_branch(args),
         Some("vcs") => run_vcs(args),
         Some("media") => run_media(args),
+        Some("render-test-tone") => run_render_test_tone(args),
+        Some("render-project") => run_render_project(args),
         Some("history") => {
             let path = required_arg(&mut args, "path")?;
             no_extra_args(args)?;
@@ -84,6 +86,53 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             "unknown command: {command}\nrun `daw --help` for usage"
         )),
     }
+}
+
+fn run_render_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let output = required_arg(&mut args, "output")?;
+    let duration = optional_f32(args.next(), 1.0, "duration-seconds")?;
+    no_extra_args(args)?;
+    let buffer = daw_engine::render_sine(
+        440.0,
+        duration,
+        0.25,
+        daw_engine::DEFAULT_SAMPLE_RATE,
+        daw_engine::DEFAULT_CHANNELS,
+    )
+    .map_err(|error| format!("failed to render test tone: {error}"))?;
+    daw_engine::write_wav(output.as_ref(), &buffer)
+        .map_err(|error| format!("failed to write test tone: {error}"))?;
+    println!(
+        "rendered test tone: {} frames at {} Hz -> {}",
+        buffer.frames(),
+        buffer.sample_rate,
+        output
+    );
+    Ok(())
+}
+
+fn run_render_project(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let project_path = required_arg(&mut args, "path")?;
+    let output = required_arg(&mut args, "output")?;
+    let duration = optional_f32(args.next(), 1.0, "duration-seconds")?;
+    no_extra_args(args)?;
+    daw_model::load_project(project_path.as_ref())
+        .map_err(|error| format!("project is invalid: {error}"))?;
+    let buffer = daw_engine::render_silence(
+        duration,
+        daw_engine::DEFAULT_SAMPLE_RATE,
+        daw_engine::DEFAULT_CHANNELS,
+    )
+    .map_err(|error| format!("failed to render project: {error}"))?;
+    daw_engine::write_wav(output.as_ref(), &buffer)
+        .map_err(|error| format!("failed to write project render: {error}"))?;
+    println!(
+        "rendered project placeholder: {} frames at {} Hz -> {}",
+        buffer.frames(),
+        buffer.sample_rate,
+        output
+    );
+    Ok(())
 }
 
 fn run_media(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -407,6 +456,8 @@ fn print_help() {
     println!("  daw media list <path>");
     println!("  daw media verify <path>");
     println!("  daw media relink <path> <hash> <replacement>");
+    println!("  daw render-test-tone <output> [duration-seconds]");
+    println!("  daw render-project <path> <output> [duration-seconds]");
     println!("  daw diff <path> <left-ref> <right-ref>");
     println!("  daw merge <path> <source-branch>");
     println!("  daw history <path>");
@@ -417,6 +468,14 @@ fn print_help() {
 fn required_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
     args.next()
         .ok_or_else(|| format!("missing required argument: {name}"))
+}
+
+fn optional_f32(value: Option<String>, default: f32, name: &str) -> Result<f32, String> {
+    value.map_or(Ok(default), |value| {
+        value
+            .parse::<f32>()
+            .map_err(|error| format!("invalid {name}: {error}"))
+    })
 }
 
 fn no_extra_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {

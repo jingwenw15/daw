@@ -72,3 +72,14 @@ cargo run --bin daw -- media list /tmp/my-session
 cargo run --bin daw -- media verify /tmp/my-session
 cargo run --bin daw -- media relink /tmp/my-session <hash> /path/to/replacement.wav
 ```
+
+## Stage 6
+
+The offline engine can render deterministic WAV files. `render-test-tone`
+generates a 440 Hz sine tone, and `render-project` currently validates the
+project and writes a silent placeholder render until timeline clips are added.
+
+```sh
+cargo run --bin daw -- render-test-tone /tmp/test-tone.wav 1.0
+cargo run --bin daw -- render-project /tmp/my-session /tmp/project-render.wav 1.0
+```
