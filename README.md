@@ -124,3 +124,14 @@ handle instead of waiting for a fixed test tone to finish.
 ```sh
 cargo run --bin daw-ui
 ```
+
+## Stage 11
+
+The native UI can import local 16-bit PCM WAV media into the content-addressed
+media store, register it in the command-log-backed project model, add clips to
+tracks, and play/stop the resulting timeline.
+
+```sh
+cargo run --bin daw -- render-test-tone /private/tmp/test-tone.wav 2.0
+cargo run --bin daw-ui
+```

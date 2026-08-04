@@ -15,6 +15,11 @@ struct DawApp {
     project_path: String,
     new_project_name: String,
     new_track_name: String,
+    media_source_path: String,
+    clip_track_id: String,
+    clip_media_id: String,
+    clip_start_sample: String,
+    clip_duration_samples: String,
     snapshot_message: String,
     status: String,
     project: Option<daw_model::Project>,
@@ -29,6 +34,11 @@ impl Default for DawApp {
             project_path: "/private/tmp/daw-ui-project".to_owned(),
             new_project_name: "UI Project".to_owned(),
             new_track_name: "Audio".to_owned(),
+            media_source_path: "/private/tmp/test-tone.wav".to_owned(),
+            clip_track_id: String::new(),
+            clip_media_id: String::new(),
+            clip_start_sample: "0".to_owned(),
+            clip_duration_samples: "48000".to_owned(),
             snapshot_message: "UI snapshot".to_owned(),
             status: "No project loaded".to_owned(),
             project: None,
@@ -42,7 +52,14 @@ impl Default for DawApp {
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll_playback();
+        self.render_transport(ctx);
+        self.render_inspector(ctx);
+        self.render_project(ctx);
+    }
+}
 
+impl DawApp {
+    fn render_transport(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("transport").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Project");
@@ -64,7 +81,9 @@ impl eframe::App for DawApp {
                 }
             });
         });
+    }
 
+    fn render_inspector(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("inspector")
             .resizable(true)
             .default_width(280.0)
@@ -79,6 +98,31 @@ impl eframe::App for DawApp {
                     self.add_track();
                 }
                 ui.separator();
+                ui.label("Media source path");
+                ui.text_edit_singleline(&mut self.media_source_path);
+                if ui.button("Import Media").clicked() {
+                    self.import_media();
+                }
+                ui.separator();
+                ui.label("Clip track id");
+                ui.text_edit_singleline(&mut self.clip_track_id);
+                ui.label("Clip media id");
+                ui.text_edit_singleline(&mut self.clip_media_id);
+                ui.horizontal(|ui| {
+                    ui.label("Start");
+                    ui.text_edit_singleline(&mut self.clip_start_sample);
+                    ui.label("Duration");
+                    ui.text_edit_singleline(&mut self.clip_duration_samples);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Use First IDs").clicked() {
+                        self.use_first_clip_ids();
+                    }
+                    if ui.button("Add Clip").clicked() {
+                        self.add_clip();
+                    }
+                });
+                ui.separator();
                 ui.label("Snapshot message");
                 ui.text_edit_singleline(&mut self.snapshot_message);
                 if ui.button("Create Snapshot").clicked() {
@@ -87,7 +131,9 @@ impl eframe::App for DawApp {
                 ui.separator();
                 ui.label(&self.status);
             });
+    }
 
+    fn render_project(&self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(project) = &self.project {
                 ui.heading(&project.name);
@@ -97,30 +143,9 @@ impl eframe::App for DawApp {
                 });
                 ui.separator();
                 ui.columns(3, |columns| {
-                    columns[0].heading("Tracks");
-                    for track in &project.tracks {
-                        columns[0].group(|ui| {
-                            ui.label(&track.name);
-                            ui.monospace(track.id.to_string());
-                            ui.label(format!("clips: {}", track.clips.len()));
-                        });
-                    }
-
-                    columns[1].heading("Media");
-                    for media in &self.media {
-                        columns[1].group(|ui| {
-                            ui.monospace(&media.hash);
-                            ui.label(format!("{} bytes", media.byte_size));
-                        });
-                    }
-
-                    columns[2].heading("History");
-                    for item in &self.history {
-                        columns[2].group(|ui| {
-                            ui.monospace(item.id.to_string());
-                            ui.label(&item.summary);
-                        });
-                    }
+                    render_tracks_column(&mut columns[0], project);
+                    render_media_column(&mut columns[1], project, &self.media);
+                    render_history_column(&mut columns[2], &self.history);
                 });
             } else {
                 ui.heading("No project loaded");
@@ -128,9 +153,7 @@ impl eframe::App for DawApp {
             }
         });
     }
-}
 
-impl DawApp {
     fn create_project(&mut self) {
         let path = PathBuf::from(&self.project_path);
         match daw_model::init_project(&path, &self.new_project_name) {
@@ -174,9 +197,79 @@ impl DawApp {
         match daw_model::add_track(&path, &self.new_track_name) {
             Ok(track) => {
                 self.status = format!("Added track '{}'", track.name);
+                self.clip_track_id = track.id.to_string();
                 self.reload_project();
             }
             Err(error) => self.status = format!("Add track failed: {error}"),
+        }
+    }
+
+    fn import_media(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        let object = match daw_media::import_media(&path, Path::new(&self.media_source_path)) {
+            Ok(object) => object,
+            Err(error) => {
+                self.status = format!("Import failed: {error}");
+                return;
+            }
+        };
+
+        match daw_model::add_media_reference(
+            &path,
+            &object.hash,
+            Some(object.original_path.clone()),
+        ) {
+            Ok(media) => {
+                self.clip_media_id = media.id.to_string();
+                self.status = format!("Imported {} bytes as {}", object.byte_size, object.hash);
+                self.reload_project();
+            }
+            Err(error) => self.status = format!("Media registration failed: {error}"),
+        }
+    }
+
+    fn use_first_clip_ids(&mut self) {
+        if let Some(project) = &self.project {
+            if let Some(track) = project.tracks.first() {
+                self.clip_track_id = track.id.to_string();
+            }
+            if let Some(media) = project.media.first() {
+                self.clip_media_id = media.id.to_string();
+            }
+            "Selected first track/media IDs".clone_into(&mut self.status);
+        } else {
+            "Open a project before selecting IDs".clone_into(&mut self.status);
+        }
+    }
+
+    fn add_clip(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        let start_sample = match parse_u64(&self.clip_start_sample, "clip start") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let duration_samples = match parse_u64(&self.clip_duration_samples, "clip duration") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        match daw_model::add_clip(
+            &path,
+            &daw_model::StableId::from_string(self.clip_track_id.clone()),
+            &daw_model::StableId::from_string(self.clip_media_id.clone()),
+            start_sample,
+            duration_samples,
+        ) {
+            Ok(clip) => {
+                self.status = format!("Added clip {}", clip.id);
+                self.reload_project();
+            }
+            Err(error) => self.status = format!("Add clip failed: {error}"),
         }
     }
 
@@ -229,6 +322,57 @@ impl DawApp {
         {
             self.stop_playback();
         }
+    }
+}
+
+fn render_tracks_column(ui: &mut egui::Ui, project: &daw_model::Project) {
+    ui.heading("Tracks");
+    for track in &project.tracks {
+        ui.group(|ui| {
+            ui.label(&track.name);
+            ui.monospace(track.id.to_string());
+            ui.label(format!("clips: {}", track.clips.len()));
+            for clip in &track.clips {
+                ui.label(format!(
+                    "clip {} at {} for {}",
+                    clip.id, clip.start_sample, clip.duration_samples
+                ));
+            }
+        });
+    }
+}
+
+fn render_media_column(
+    ui: &mut egui::Ui,
+    project: &daw_model::Project,
+    media_objects: &[daw_media::MediaObject],
+) {
+    ui.heading("Media");
+    for media_ref in &project.media {
+        ui.group(|ui| {
+            ui.label("project ref");
+            ui.monospace(media_ref.id.to_string());
+            if let Some(hash) = &media_ref.content_hash {
+                ui.label(hash);
+            }
+        });
+    }
+    for media in media_objects {
+        ui.group(|ui| {
+            ui.label("store object");
+            ui.monospace(&media.hash);
+            ui.label(format!("{} bytes", media.byte_size));
+        });
+    }
+}
+
+fn render_history_column(ui: &mut egui::Ui, history: &[daw_model::HistoryItem]) {
+    ui.heading("History");
+    for item in history {
+        ui.group(|ui| {
+            ui.monospace(item.id.to_string());
+            ui.label(&item.summary);
+        });
     }
 }
 
@@ -334,6 +478,12 @@ fn limit_buffer_frames(buffer: &daw_engine::AudioBuffer, frames: usize) -> daw_e
         channels: buffer.channels,
         samples: buffer.samples[..sample_count].to_vec(),
     }
+}
+
+fn parse_u64(value: &str, label: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|error| format!("Invalid {label}: {error}"))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
