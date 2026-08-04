@@ -20,6 +20,10 @@ struct DawApp {
     clip_media_id: String,
     clip_start_sample: String,
     clip_duration_samples: String,
+    mixer_track_id: String,
+    mixer_volume_percent: String,
+    mixer_muted: bool,
+    mixer_solo: bool,
     snapshot_message: String,
     status: String,
     project: Option<daw_model::Project>,
@@ -39,6 +43,10 @@ impl Default for DawApp {
             clip_media_id: String::new(),
             clip_start_sample: "0".to_owned(),
             clip_duration_samples: "48000".to_owned(),
+            mixer_track_id: String::new(),
+            mixer_volume_percent: "100".to_owned(),
+            mixer_muted: false,
+            mixer_solo: false,
             snapshot_message: "UI snapshot".to_owned(),
             status: "No project loaded".to_owned(),
             project: None,
@@ -129,6 +137,23 @@ impl DawApp {
                     self.create_snapshot();
                 }
                 ui.separator();
+                ui.label("Mixer track id");
+                ui.text_edit_singleline(&mut self.mixer_track_id);
+                ui.label("Volume percent");
+                ui.text_edit_singleline(&mut self.mixer_volume_percent);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.mixer_muted, "Muted");
+                    ui.checkbox(&mut self.mixer_solo, "Solo");
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Use First Track").clicked() {
+                        self.use_first_mixer_track();
+                    }
+                    if ui.button("Set Controls").clicked() {
+                        self.set_track_controls();
+                    }
+                });
+                ui.separator();
                 ui.label(&self.status);
             });
     }
@@ -198,6 +223,7 @@ impl DawApp {
             Ok(track) => {
                 self.status = format!("Added track '{}'", track.name);
                 self.clip_track_id = track.id.to_string();
+                self.mixer_track_id = track.id.to_string();
                 self.reload_project();
             }
             Err(error) => self.status = format!("Add track failed: {error}"),
@@ -230,16 +256,41 @@ impl DawApp {
 
     fn use_first_clip_ids(&mut self) {
         if let Some(project) = &self.project {
-            if let Some(track) = project.tracks.first() {
+            let track = project.tracks.first().cloned();
+            let media_id = project.media.first().map(|media| media.id.to_string());
+            if let Some(track) = track {
                 self.clip_track_id = track.id.to_string();
+                self.set_mixer_fields_from_track(&track);
             }
-            if let Some(media) = project.media.first() {
-                self.clip_media_id = media.id.to_string();
+            if let Some(media_id) = media_id {
+                self.clip_media_id = media_id;
             }
             "Selected first track/media IDs".clone_into(&mut self.status);
         } else {
             "Open a project before selecting IDs".clone_into(&mut self.status);
         }
+    }
+
+    fn use_first_mixer_track(&mut self) {
+        let track = self
+            .project
+            .as_ref()
+            .and_then(|project| project.tracks.first().cloned());
+        if let Some(track) = track {
+            self.set_mixer_fields_from_track(&track);
+            "Selected first track controls".clone_into(&mut self.status);
+        } else if self.project.is_some() {
+            "Project has no tracks".clone_into(&mut self.status);
+        } else {
+            "Open a project before selecting track controls".clone_into(&mut self.status);
+        }
+    }
+
+    fn set_mixer_fields_from_track(&mut self, track: &daw_model::Track) {
+        self.mixer_track_id = track.id.to_string();
+        self.mixer_volume_percent = track.volume_percent.to_string();
+        self.mixer_muted = track.muted;
+        self.mixer_solo = track.solo;
     }
 
     fn add_clip(&mut self) {
@@ -281,6 +332,34 @@ impl DawApp {
                 self.reload_auxiliary();
             }
             Err(error) => self.status = format!("Snapshot failed: {error}"),
+        }
+    }
+
+    fn set_track_controls(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        let volume_percent = match parse_u16(&self.mixer_volume_percent, "track volume") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        match daw_model::set_track_controls(
+            &path,
+            &daw_model::StableId::from_string(self.mixer_track_id.clone()),
+            volume_percent,
+            self.mixer_muted,
+            self.mixer_solo,
+        ) {
+            Ok(track) => {
+                self.status = format!(
+                    "Set '{}' controls: volume={} muted={} solo={}",
+                    track.name, track.volume_percent, track.muted, track.solo
+                );
+                self.reload_project();
+            }
+            Err(error) => self.status = format!("Set controls failed: {error}"),
         }
     }
 
@@ -331,6 +410,10 @@ fn render_tracks_column(ui: &mut egui::Ui, project: &daw_model::Project) {
         ui.group(|ui| {
             ui.label(&track.name);
             ui.monospace(track.id.to_string());
+            ui.label(format!(
+                "volume: {} muted: {} solo: {}",
+                track.volume_percent, track.muted, track.solo
+            ));
             ui.label(format!("clips: {}", track.clips.len()));
             for clip in &track.clips {
                 ui.label(format!(
@@ -483,6 +566,12 @@ fn limit_buffer_frames(buffer: &daw_engine::AudioBuffer, frames: usize) -> daw_e
 fn parse_u64(value: &str, label: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
+        .map_err(|error| format!("Invalid {label}: {error}"))
+}
+
+fn parse_u16(value: &str, label: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
         .map_err(|error| format!("Invalid {label}: {error}"))
 }
 

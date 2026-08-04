@@ -119,6 +119,17 @@ pub enum ProjectCommand {
         /// Clip to append.
         clip: Clip,
     },
+    /// Update mixer controls for an existing track.
+    SetTrackControls {
+        /// Track receiving the mixer settings.
+        track_id: StableId,
+        /// Linear volume percentage.
+        volume_percent: u16,
+        /// True when this track should be silent.
+        muted: bool,
+        /// True when this track should be heard while non-soloed tracks are silent.
+        solo: bool,
+    },
     /// Replace current state with a stored snapshot.
     CheckoutSnapshot {
         /// Snapshot identifier to restore.
@@ -246,6 +257,12 @@ impl Project {
                     track.id
                 )));
             }
+            if track.volume_percent > 200 {
+                errors.push(ValidationError::new(format!(
+                    "track {} volume_percent must be between 0 and 200",
+                    track.id
+                )));
+            }
             track_ids.push(track.id.clone());
         }
         track_ids.sort();
@@ -341,6 +358,16 @@ impl ProjectCommand {
             }
             Self::AddClip { track_id, clip } => {
                 format!("add clip {} to track {track_id}", clip.id)
+            }
+            Self::SetTrackControls {
+                track_id,
+                volume_percent,
+                muted,
+                solo,
+            } => {
+                format!(
+                    "set track {track_id} controls volume={volume_percent} muted={muted} solo={solo}"
+                )
             }
             Self::CheckoutSnapshot { snapshot_id } => {
                 format!("checkout snapshot {snapshot_id}")
@@ -623,6 +650,40 @@ pub fn add_clip(
     Ok(clip)
 }
 
+/// Set mixer controls for an existing track.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the track is unknown, the
+/// controls are invalid, or the updated project cannot be saved.
+pub fn set_track_controls(
+    project_dir: &Path,
+    track_id: &StableId,
+    volume_percent: u16,
+    muted: bool,
+    solo: bool,
+) -> Result<Track, ProjectIoError> {
+    append_and_apply(
+        project_dir,
+        ProjectCommand::SetTrackControls {
+            track_id: track_id.clone(),
+            volume_percent,
+            muted,
+            solo,
+        },
+    )?;
+    let project = load_project(project_dir)?;
+    project
+        .tracks
+        .into_iter()
+        .find(|track| track.id == *track_id)
+        .ok_or_else(|| {
+            ProjectIoError::Invalid(vec![ValidationError::new(format!(
+                "unknown track id {track_id}"
+            ))])
+        })
+}
+
 /// Create a branch from the current project state.
 ///
 /// # Errors
@@ -884,6 +945,31 @@ fn apply_command(
                 Err(ProjectIoError::Invalid(errors))
             }
         }
+        ProjectCommand::SetTrackControls {
+            track_id,
+            volume_percent,
+            muted,
+            solo,
+        } => {
+            let track = project
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == *track_id)
+                .ok_or_else(|| {
+                    ProjectIoError::Invalid(vec![ValidationError::new(format!(
+                        "unknown track id {track_id}"
+                    ))])
+                })?;
+            track.volume_percent = *volume_percent;
+            track.muted = *muted;
+            track.solo = *solo;
+            let errors = project.validate();
+            if errors.is_empty() {
+                Ok(project)
+            } else {
+                Err(ProjectIoError::Invalid(errors))
+            }
+        }
         ProjectCommand::CheckoutSnapshot { snapshot_id } => {
             Ok(load_snapshot(project_dir, snapshot_id)?.project)
         }
@@ -1044,8 +1130,8 @@ mod tests {
     use super::{
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
-        project_file_path, replay_project, switch_branch, Project, ProjectIoError, StableId, Track,
-        PROJECT_SCHEMA_VERSION,
+        project_file_path, replay_project, set_track_controls, switch_branch, Project,
+        ProjectIoError, StableId, Track, PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1185,6 +1271,26 @@ mod tests {
 
         assert_eq!(project.media, vec![media]);
         assert_eq!(project.tracks[0].clips, vec![clip]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn sets_track_controls_through_command_log() {
+        let project_dir = temp_project_dir("track-controls");
+        init_project(&project_dir, "Mixer").expect("init project");
+        let track = add_track(&project_dir, "Lead").expect("add track");
+
+        let updated =
+            set_track_controls(&project_dir, &track.id, 75, true, false).expect("set controls");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(updated.volume_percent, 75);
+        assert!(updated.muted);
+        assert!(!updated.solo);
+        assert_eq!(project.tracks[0], updated);
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");

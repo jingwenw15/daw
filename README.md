@@ -135,3 +135,13 @@ tracks, and play/stop the resulting timeline.
 cargo run --bin daw -- render-test-tone /private/tmp/test-tone.wav 2.0
 cargo run --bin daw-ui
 ```
+
+## Stage 12
+
+Track mixer controls are command-log-backed. The CLI and UI can set volume,
+mute, and solo values, and project render/playback honors those settings.
+
+```sh
+cargo run --bin daw -- track controls /tmp/my-session <track-id> 75 false true
+cargo run --bin daw-ui
+```

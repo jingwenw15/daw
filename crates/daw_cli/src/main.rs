@@ -408,6 +408,27 @@ fn run_track(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             println!("added track '{}' ({})", track.name, track.id);
             Ok(())
         }
+        Some("controls") => {
+            let path = required_arg(&mut args, "path")?;
+            let track_id = required_arg(&mut args, "track-id")?;
+            let volume_percent = required_u16(&mut args, "volume-percent")?;
+            let muted = required_bool(&mut args, "muted")?;
+            let solo = required_bool(&mut args, "solo")?;
+            no_extra_args(args)?;
+            let track = daw_model::set_track_controls(
+                path.as_ref(),
+                &daw_model::StableId::from_string(track_id),
+                volume_percent,
+                muted,
+                solo,
+            )
+            .map_err(|error| format!("failed to set track controls: {error}"))?;
+            println!(
+                "set track '{}' controls: volume={} muted={} solo={}",
+                track.name, track.volume_percent, track.muted, track.solo
+            );
+            Ok(())
+        }
         Some(command) => Err(format!(
             "unknown track command: {command}\nrun `daw --help` for usage"
         )),
@@ -589,6 +610,7 @@ fn print_help() {
     println!("  daw validate <path>");
     println!("  daw inspect <path>");
     println!("  daw track add <path> <name>");
+    println!("  daw track controls <path> <track-id> <volume-percent> <muted> <solo>");
     println!("  daw clip add <path> <track-id> <media-id> <start-sample> <duration-samples>");
     println!("  daw snapshot create <path> [message]");
     println!("  daw branch create <path> <name>");
@@ -633,6 +655,21 @@ fn required_u64(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u
     required_arg(args, name)?
         .parse::<u64>()
         .map_err(|error| format!("invalid {name}: {error}"))
+}
+
+fn required_u16(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u16, String> {
+    required_arg(args, name)?
+        .parse::<u16>()
+        .map_err(|error| format!("invalid {name}: {error}"))
+}
+
+fn required_bool(args: &mut impl Iterator<Item = String>, name: &str) -> Result<bool, String> {
+    let value = required_arg(args, name)?;
+    match value.as_str() {
+        "true" | "yes" | "1" | "on" => Ok(true),
+        "false" | "no" | "0" | "off" => Ok(false),
+        _ => Err(format!("invalid {name}: expected true or false")),
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
