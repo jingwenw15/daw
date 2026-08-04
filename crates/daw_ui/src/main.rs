@@ -1,11 +1,7 @@
 //! Native desktop UI shell for the DAW.
 
 use eframe::egui;
-use std::{
-    path::PathBuf,
-    sync::mpsc::{self, Receiver},
-    thread,
-};
+use std::path::{Path, PathBuf};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -24,7 +20,7 @@ struct DawApp {
     project: Option<daw_model::Project>,
     media: Vec<daw_media::MediaObject>,
     history: Vec<daw_model::HistoryItem>,
-    playback_rx: Option<Receiver<String>>,
+    transport: Option<daw_engine::PlaybackTransport>,
 }
 
 impl Default for DawApp {
@@ -38,7 +34,7 @@ impl Default for DawApp {
             project: None,
             media: Vec::new(),
             history: Vec::new(),
-            playback_rx: None,
+            transport: None,
         }
     }
 }
@@ -61,11 +57,10 @@ impl eframe::App for DawApp {
                     self.validate_project();
                 }
                 if ui.button("Play").clicked() {
-                    self.play_test_tone();
+                    self.play_project();
                 }
                 if ui.button("Stop").clicked() {
-                    "Stop requested; short test playback will end automatically"
-                        .clone_into(&mut self.status);
+                    self.stop_playback();
                 }
             });
         });
@@ -196,28 +191,155 @@ impl DawApp {
         }
     }
 
-    fn play_test_tone(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        self.playback_rx = Some(rx);
-        "Starting playback".clone_into(&mut self.status);
-        thread::spawn(move || {
-            let message = match daw_engine::play_test_tone(1.0) {
-                Ok(report) => format!(
-                    "Played on '{}' with {} stream errors",
-                    report.device_name, report.stream_errors
-                ),
-                Err(error) => format!("Playback failed: {error}"),
-            };
-            let _ = tx.send(message);
-        });
+    fn play_project(&mut self) {
+        if self.transport.is_some() {
+            self.stop_playback();
+        }
+
+        let path = PathBuf::from(&self.project_path);
+        match render_project_buffer(&path, 1.0).and_then(|buffer| {
+            daw_engine::start_buffer_playback(buffer)
+                .map_err(|error| format!("Playback failed: {error}"))
+        }) {
+            Ok(transport) => {
+                self.status = format!("Playing on '{}'", transport.report().device_name);
+                self.transport = Some(transport);
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some(mut transport) = self.transport.take() {
+            let report = transport.stop();
+            self.status = format!(
+                "Stopped after {} frames on '{}'",
+                report.frames_played, report.device_name
+            );
+        } else {
+            "Nothing is playing".clone_into(&mut self.status);
+        }
     }
 
     fn poll_playback(&mut self) {
-        if let Some(rx) = &self.playback_rx {
-            if let Ok(message) = rx.try_recv() {
-                self.status = message;
-                self.playback_rx = None;
-            }
+        if self
+            .transport
+            .as_ref()
+            .is_some_and(daw_engine::PlaybackTransport::is_finished)
+        {
+            self.stop_playback();
         }
     }
+}
+
+fn render_project_buffer(
+    project_path: &Path,
+    minimum_duration: f32,
+) -> Result<daw_engine::AudioBuffer, String> {
+    let project = daw_model::load_project(project_path)
+        .map_err(|error| format!("Project is invalid: {error}"))?;
+    let media_objects = daw_media::list_media(project_path)
+        .map_err(|error| format!("Failed to list media: {error}"))?;
+    let mut total_frames = duration_to_frames(minimum_duration, daw_engine::DEFAULT_SAMPLE_RATE)?;
+    for track in &project.tracks {
+        for clip in &track.clips {
+            let clip_end = usize::try_from(clip.start_sample.saturating_add(clip.duration_samples))
+                .map_err(|_| "Clip timeline position is too large".to_owned())?;
+            total_frames = total_frames.max(clip_end);
+        }
+    }
+
+    let mut output = daw_engine::AudioBuffer {
+        sample_rate: daw_engine::DEFAULT_SAMPLE_RATE,
+        channels: daw_engine::DEFAULT_CHANNELS,
+        samples: vec![0.0; total_frames * usize::from(daw_engine::DEFAULT_CHANNELS)],
+    };
+    let solo_active = project.tracks.iter().any(|track| track.solo);
+
+    for track in &project.tracks {
+        if track.muted || (solo_active && !track.solo) {
+            continue;
+        }
+        for clip in &track.clips {
+            mix_clip_from_project(
+                project_path,
+                &project,
+                &media_objects,
+                &mut output,
+                track,
+                clip,
+            )?;
+        }
+    }
+
+    Ok(output)
+}
+
+fn mix_clip_from_project(
+    project_path: &Path,
+    project: &daw_model::Project,
+    media_objects: &[daw_media::MediaObject],
+    output: &mut daw_engine::AudioBuffer,
+    track: &daw_model::Track,
+    clip: &daw_model::Clip,
+) -> Result<(), String> {
+    let media = project
+        .media
+        .iter()
+        .find(|media| media.id == clip.media_id)
+        .ok_or_else(|| {
+            format!(
+                "Clip {} references unknown media {}",
+                clip.id, clip.media_id
+            )
+        })?;
+    let hash = media
+        .content_hash
+        .as_deref()
+        .ok_or_else(|| format!("Media {} has no content hash", media.id))?;
+    let object = media_objects
+        .iter()
+        .find(|object| object.hash == hash)
+        .ok_or_else(|| format!("Media hash {hash} is not imported"))?;
+    let path =
+        daw_media::media_object_path(project_path, &object.hash, object.extension.as_deref());
+    let decoded = daw_engine::read_wav(&path)
+        .map_err(|error| format!("Failed to read media {hash}: {error}"))?;
+    if decoded.sample_rate != output.sample_rate || decoded.channels != output.channels {
+        return Err(format!(
+            "Media {hash} is {} Hz/{} channels; expected {} Hz/{} channels",
+            decoded.sample_rate, decoded.channels, output.sample_rate, output.channels
+        ));
+    }
+    let limited = limit_buffer_frames(
+        &decoded,
+        usize::try_from(clip.duration_samples)
+            .map_err(|_| "Clip duration is too large".to_owned())?,
+    );
+    daw_engine::mix_clip(
+        output,
+        &limited,
+        usize::try_from(clip.start_sample).map_err(|_| "Clip start is too large".to_owned())?,
+        track.volume_percent,
+        track.muted,
+    );
+    Ok(())
+}
+
+fn limit_buffer_frames(buffer: &daw_engine::AudioBuffer, frames: usize) -> daw_engine::AudioBuffer {
+    let channels = usize::from(buffer.channels);
+    let sample_count = buffer.samples.len().min(frames.saturating_mul(channels));
+    daw_engine::AudioBuffer {
+        sample_rate: buffer.sample_rate,
+        channels: buffer.channels,
+        samples: buffer.samples[..sample_count].to_vec(),
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn duration_to_frames(duration: f32, sample_rate: u32) -> Result<usize, String> {
+    if duration <= 0.0 {
+        return Err("Duration must be greater than zero".to_owned());
+    }
+    Ok((f64::from(duration) * f64::from(sample_rate)).round() as usize)
 }

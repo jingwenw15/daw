@@ -114,3 +114,13 @@ short playback smoke tone.
 ```sh
 cargo run --bin daw-ui
 ```
+
+## Stage 10
+
+The engine exposes a cancellable playback transport. The UI now renders the
+loaded project timeline for playback and its Stop button owns a real transport
+handle instead of waiting for a fixed test tone to finish.
+
+```sh
+cargo run --bin daw-ui
+```

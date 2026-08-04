@@ -7,7 +7,7 @@ use cpal::{
 use std::{f64::consts::TAU, fmt, fs, io, path::Path};
 use std::{
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Arc,
     },
     thread,
@@ -58,6 +58,18 @@ pub struct PlaybackReport {
     pub frames_played: usize,
     /// Stream error callback count.
     pub stream_errors: u32,
+}
+
+/// Handle for an active real-time playback stream.
+pub struct PlaybackTransport {
+    stream: Option<cpal::Stream>,
+    device_name: String,
+    sample_rate: u32,
+    channels: u16,
+    next_sample: Arc<AtomicUsize>,
+    stream_errors: Arc<AtomicU32>,
+    stop_requested: Arc<AtomicBool>,
+    total_samples: usize,
 }
 
 /// Error returned by real-time playback.
@@ -144,6 +156,21 @@ pub fn play_buffer(
     buffer: AudioBuffer,
     hold_seconds: f32,
 ) -> Result<PlaybackReport, PlaybackError> {
+    let mut transport = start_buffer_playback(buffer)?;
+    thread::sleep(Duration::from_secs_f32(hold_seconds));
+    Ok(transport.stop())
+}
+
+/// Start playing a rendered buffer through the default output device.
+///
+/// The returned transport owns the native audio stream. Dropping or stopping it
+/// ends playback.
+///
+/// # Errors
+///
+/// Returns an error if no output device exists, the stream cannot be built, or
+/// the stream cannot be started.
+pub fn start_buffer_playback(buffer: AudioBuffer) -> Result<PlaybackTransport, PlaybackError> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -156,9 +183,11 @@ pub fn play_buffer(
         .map_err(|error| PlaybackError::DefaultConfig(error.to_string()))?;
     let sample_rate = supported_config.sample_rate().0;
     let channels = supported_config.channels();
+    let total_samples = buffer.samples.len();
     let buffer = Arc::new(buffer);
     let next_sample = Arc::new(AtomicUsize::new(0));
     let stream_errors = Arc::new(AtomicU32::new(0));
+    let stop_requested = Arc::new(AtomicBool::new(false));
     let stream_config = supported_config.config();
 
     let stream = match supported_config.sample_format() {
@@ -167,6 +196,7 @@ pub fn play_buffer(
             &stream_config,
             Arc::clone(&buffer),
             Arc::clone(&next_sample),
+            Arc::clone(&stop_requested),
             &stream_errors,
         ),
         cpal::SampleFormat::I16 => build_test_tone_stream::<i16>(
@@ -174,6 +204,7 @@ pub fn play_buffer(
             &stream_config,
             Arc::clone(&buffer),
             Arc::clone(&next_sample),
+            Arc::clone(&stop_requested),
             &stream_errors,
         ),
         cpal::SampleFormat::U16 => build_test_tone_stream::<u16>(
@@ -181,6 +212,7 @@ pub fn play_buffer(
             &stream_config,
             Arc::clone(&buffer),
             Arc::clone(&next_sample),
+            Arc::clone(&stop_requested),
             &stream_errors,
         ),
         format => Err(PlaybackError::BuildStream(format!(
@@ -191,15 +223,16 @@ pub fn play_buffer(
     stream
         .play()
         .map_err(|error| PlaybackError::PlayStream(error.to_string()))?;
-    thread::sleep(Duration::from_secs_f32(hold_seconds));
-    drop(stream);
 
-    Ok(PlaybackReport {
+    Ok(PlaybackTransport {
+        stream: Some(stream),
         device_name,
         sample_rate,
         channels,
-        frames_played: next_sample.load(Ordering::Relaxed) / usize::from(channels),
-        stream_errors: stream_errors.load(Ordering::Relaxed),
+        next_sample,
+        stream_errors,
+        stop_requested,
+        total_samples,
     })
 }
 
@@ -327,6 +360,40 @@ impl AudioBuffer {
     }
 }
 
+impl PlaybackTransport {
+    /// Stop playback and return a final report.
+    #[must_use]
+    pub fn stop(&mut self) -> PlaybackReport {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        drop(self.stream.take());
+        self.report()
+    }
+
+    /// Return the latest playback counters without stopping the stream.
+    #[must_use]
+    pub fn report(&self) -> PlaybackReport {
+        PlaybackReport {
+            device_name: self.device_name.clone(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            frames_played: self.next_sample.load(Ordering::Relaxed) / usize::from(self.channels),
+            stream_errors: self.stream_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Return true once the stream has consumed the complete source buffer.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.next_sample.load(Ordering::Relaxed) >= self.total_samples
+    }
+}
+
+impl Drop for PlaybackTransport {
+    fn drop(&mut self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+    }
+}
+
 impl fmt::Display for RenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -445,6 +512,7 @@ fn build_test_tone_stream<T>(
     config: &cpal::StreamConfig,
     buffer: Arc<AudioBuffer>,
     next_sample: Arc<AtomicUsize>,
+    stop_requested: Arc<AtomicBool>,
     stream_errors: &Arc<AtomicU32>,
 ) -> Result<cpal::Stream, PlaybackError>
 where
@@ -454,7 +522,9 @@ where
     device
         .build_output_stream(
             config,
-            move |output: &mut [T], _| write_playback_data(output, &buffer, &next_sample),
+            move |output: &mut [T], _| {
+                write_playback_data(output, &buffer, &next_sample, &stop_requested);
+            },
             move |_| {
                 error_counter.fetch_add(1, Ordering::Relaxed);
             },
@@ -463,12 +533,20 @@ where
         .map_err(|error| PlaybackError::BuildStream(error.to_string()))
 }
 
-fn write_playback_data<T>(output: &mut [T], buffer: &AudioBuffer, next_sample: &AtomicUsize)
-where
+fn write_playback_data<T>(
+    output: &mut [T],
+    buffer: &AudioBuffer,
+    next_sample: &AtomicUsize,
+    stop_requested: &AtomicBool,
+) where
     T: Sample + FromSample<f32>,
 {
     for sample in output {
-        let index = next_sample.fetch_add(1, Ordering::Relaxed);
+        let index = if stop_requested.load(Ordering::Relaxed) {
+            buffer.samples.len()
+        } else {
+            next_sample.fetch_add(1, Ordering::Relaxed)
+        };
         let value = buffer.samples.get(index).copied().unwrap_or(0.0);
         *sample = T::from_sample(value);
     }
