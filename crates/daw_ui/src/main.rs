@@ -20,6 +20,9 @@ struct DawApp {
     clip_media_id: String,
     clip_start_sample: String,
     clip_duration_samples: String,
+    edit_clip_id: String,
+    edit_clip_start_sample: String,
+    edit_clip_duration_samples: String,
     mixer_track_id: String,
     mixer_volume_percent: String,
     mixer_muted: bool,
@@ -43,6 +46,9 @@ impl Default for DawApp {
             clip_media_id: String::new(),
             clip_start_sample: "0".to_owned(),
             clip_duration_samples: "48000".to_owned(),
+            edit_clip_id: String::new(),
+            edit_clip_start_sample: "0".to_owned(),
+            edit_clip_duration_samples: "48000".to_owned(),
             mixer_track_id: String::new(),
             mixer_volume_percent: "100".to_owned(),
             mixer_muted: false,
@@ -128,6 +134,26 @@ impl DawApp {
                     }
                     if ui.button("Add Clip").clicked() {
                         self.add_clip();
+                    }
+                });
+                ui.separator();
+                ui.label("Edit clip id");
+                ui.text_edit_singleline(&mut self.edit_clip_id);
+                ui.horizontal(|ui| {
+                    ui.label("Start");
+                    ui.text_edit_singleline(&mut self.edit_clip_start_sample);
+                    ui.label("Duration");
+                    ui.text_edit_singleline(&mut self.edit_clip_duration_samples);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Use First Clip").clicked() {
+                        self.use_first_clip();
+                    }
+                    if ui.button("Move Clip").clicked() {
+                        self.move_clip();
+                    }
+                    if ui.button("Remove Clip").clicked() {
+                        self.remove_clip();
                     }
                 });
                 ui.separator();
@@ -318,6 +344,7 @@ impl DawApp {
         ) {
             Ok(clip) => {
                 self.status = format!("Added clip {}", clip.id);
+                self.set_clip_edit_fields(&clip);
                 self.reload_project();
             }
             Err(error) => self.status = format!("Add clip failed: {error}"),
@@ -332,6 +359,73 @@ impl DawApp {
                 self.reload_auxiliary();
             }
             Err(error) => self.status = format!("Snapshot failed: {error}"),
+        }
+    }
+
+    fn use_first_clip(&mut self) {
+        let clip = self.project.as_ref().and_then(first_project_clip).cloned();
+        if let Some(clip) = clip {
+            self.set_clip_edit_fields(&clip);
+            "Selected first clip".clone_into(&mut self.status);
+        } else if self.project.is_some() {
+            "Project has no clips".clone_into(&mut self.status);
+        } else {
+            "Open a project before selecting a clip".clone_into(&mut self.status);
+        }
+    }
+
+    fn set_clip_edit_fields(&mut self, clip: &daw_model::Clip) {
+        self.edit_clip_id = clip.id.to_string();
+        self.edit_clip_start_sample = clip.start_sample.to_string();
+        self.edit_clip_duration_samples = clip.duration_samples.to_string();
+    }
+
+    fn move_clip(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        let start_sample = match parse_u64(&self.edit_clip_start_sample, "clip edit start") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let duration_samples =
+            match parse_u64(&self.edit_clip_duration_samples, "clip edit duration") {
+                Ok(value) => value,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            };
+        match daw_model::set_clip_placement(
+            &path,
+            &daw_model::StableId::from_string(self.edit_clip_id.clone()),
+            start_sample,
+            duration_samples,
+        ) {
+            Ok(clip) => {
+                self.status = format!(
+                    "Moved clip {} to {} for {}",
+                    clip.id, clip.start_sample, clip.duration_samples
+                );
+                self.reload_project();
+            }
+            Err(error) => self.status = format!("Move clip failed: {error}"),
+        }
+    }
+
+    fn remove_clip(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::remove_clip(
+            &path,
+            &daw_model::StableId::from_string(self.edit_clip_id.clone()),
+        ) {
+            Ok(clip) => {
+                self.status = format!("Removed clip {}", clip.id);
+                self.edit_clip_id.clear();
+                self.reload_project();
+            }
+            Err(error) => self.status = format!("Remove clip failed: {error}"),
         }
     }
 
@@ -457,6 +551,10 @@ fn render_history_column(ui: &mut egui::Ui, history: &[daw_model::HistoryItem]) 
             ui.label(&item.summary);
         });
     }
+}
+
+fn first_project_clip(project: &daw_model::Project) -> Option<&daw_model::Clip> {
+    project.tracks.iter().flat_map(|track| &track.clips).next()
 }
 
 fn render_project_buffer(

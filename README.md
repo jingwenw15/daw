@@ -145,3 +145,14 @@ mute, and solo values, and project render/playback honors those settings.
 cargo run --bin daw -- track controls /tmp/my-session <track-id> 75 false true
 cargo run --bin daw-ui
 ```
+
+## Stage 13
+
+Timeline clip placement edits are command-log-backed. Clips can be moved,
+resized, or removed through the CLI and UI, and replay rebuilds those edits.
+
+```sh
+cargo run --bin daw -- clip move /tmp/my-session <clip-id> 12000 36000
+cargo run --bin daw -- clip remove /tmp/my-session <clip-id>
+cargo run --bin daw-ui
+```

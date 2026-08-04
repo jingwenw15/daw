@@ -250,6 +250,37 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             println!("added clip {}", clip.id);
             Ok(())
         }
+        Some("move") => {
+            let project = required_arg(&mut args, "path")?;
+            let clip_id = required_arg(&mut args, "clip-id")?;
+            let start_sample = required_u64(&mut args, "start-sample")?;
+            let duration_samples = required_u64(&mut args, "duration-samples")?;
+            no_extra_args(args)?;
+            let clip = daw_model::set_clip_placement(
+                project.as_ref(),
+                &daw_model::StableId::from_string(clip_id),
+                start_sample,
+                duration_samples,
+            )
+            .map_err(|error| format!("failed to move clip: {error}"))?;
+            println!(
+                "moved clip {} to {} for {}",
+                clip.id, clip.start_sample, clip.duration_samples
+            );
+            Ok(())
+        }
+        Some("remove") => {
+            let project = required_arg(&mut args, "path")?;
+            let clip_id = required_arg(&mut args, "clip-id")?;
+            no_extra_args(args)?;
+            let clip = daw_model::remove_clip(
+                project.as_ref(),
+                &daw_model::StableId::from_string(clip_id),
+            )
+            .map_err(|error| format!("failed to remove clip: {error}"))?;
+            println!("removed clip {}", clip.id);
+            Ok(())
+        }
         Some(command) => Err(format!(
             "unknown clip command: {command}\nrun `daw --help` for usage"
         )),
@@ -612,6 +643,8 @@ fn print_help() {
     println!("  daw track add <path> <name>");
     println!("  daw track controls <path> <track-id> <volume-percent> <muted> <solo>");
     println!("  daw clip add <path> <track-id> <media-id> <start-sample> <duration-samples>");
+    println!("  daw clip move <path> <clip-id> <start-sample> <duration-samples>");
+    println!("  daw clip remove <path> <clip-id>");
     println!("  daw snapshot create <path> [message]");
     println!("  daw branch create <path> <name>");
     println!("  daw branch list <path>");

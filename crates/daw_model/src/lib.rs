@@ -119,6 +119,20 @@ pub enum ProjectCommand {
         /// Clip to append.
         clip: Clip,
     },
+    /// Move or resize an existing clip.
+    SetClipPlacement {
+        /// Clip receiving the placement settings.
+        clip_id: StableId,
+        /// Timeline start in samples.
+        start_sample: u64,
+        /// Clip duration in samples.
+        duration_samples: u64,
+    },
+    /// Remove an existing clip from its track.
+    RemoveClip {
+        /// Clip to remove.
+        clip_id: StableId,
+    },
     /// Update mixer controls for an existing track.
     SetTrackControls {
         /// Track receiving the mixer settings.
@@ -263,6 +277,20 @@ impl Project {
                     track.id
                 )));
             }
+            for clip in &track.clips {
+                if clip.duration_samples == 0 {
+                    errors.push(ValidationError::new(format!(
+                        "clip {} duration_samples must be greater than zero",
+                        clip.id
+                    )));
+                }
+                if !self.media.iter().any(|media| media.id == clip.media_id) {
+                    errors.push(ValidationError::new(format!(
+                        "clip {} references unknown media {}",
+                        clip.id, clip.media_id
+                    )));
+                }
+            }
             track_ids.push(track.id.clone());
         }
         track_ids.sort();
@@ -359,6 +387,16 @@ impl ProjectCommand {
             Self::AddClip { track_id, clip } => {
                 format!("add clip {} to track {track_id}", clip.id)
             }
+            Self::SetClipPlacement {
+                clip_id,
+                start_sample,
+                duration_samples,
+            } => {
+                format!(
+                    "set clip {clip_id} placement start={start_sample} duration={duration_samples}"
+                )
+            }
+            Self::RemoveClip { clip_id } => format!("remove clip {clip_id}"),
             Self::SetTrackControls {
                 track_id,
                 volume_percent,
@@ -650,6 +688,56 @@ pub fn add_clip(
     Ok(clip)
 }
 
+/// Move or resize an existing clip.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the clip is unknown, the
+/// placement is invalid, or the updated project cannot be saved.
+pub fn set_clip_placement(
+    project_dir: &Path,
+    clip_id: &StableId,
+    start_sample: u64,
+    duration_samples: u64,
+) -> Result<Clip, ProjectIoError> {
+    append_and_apply(
+        project_dir,
+        ProjectCommand::SetClipPlacement {
+            clip_id: clip_id.clone(),
+            start_sample,
+            duration_samples,
+        },
+    )?;
+    let project = load_project(project_dir)?;
+    find_clip(&project, clip_id).cloned().ok_or_else(|| {
+        ProjectIoError::Invalid(vec![ValidationError::new(format!(
+            "unknown clip id {clip_id}"
+        ))])
+    })
+}
+
+/// Remove an existing clip.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the clip is unknown, or
+/// the updated project cannot be saved.
+pub fn remove_clip(project_dir: &Path, clip_id: &StableId) -> Result<Clip, ProjectIoError> {
+    let project = load_project(project_dir)?;
+    let removed = find_clip(&project, clip_id).cloned().ok_or_else(|| {
+        ProjectIoError::Invalid(vec![ValidationError::new(format!(
+            "unknown clip id {clip_id}"
+        ))])
+    })?;
+    append_and_apply(
+        project_dir,
+        ProjectCommand::RemoveClip {
+            clip_id: clip_id.clone(),
+        },
+    )?;
+    Ok(removed)
+}
+
 /// Set mixer controls for an existing track.
 ///
 /// # Errors
@@ -897,12 +985,7 @@ fn apply_command(
     match command {
         ProjectCommand::AddTrack { track } => {
             project.tracks.push(track.clone());
-            let errors = project.validate();
-            if errors.is_empty() {
-                Ok(project)
-            } else {
-                Err(ProjectIoError::Invalid(errors))
-            }
+            validate_project_state(project)
         }
         ProjectCommand::AddMediaReference { media } => {
             if let Some(existing) = project
@@ -914,65 +997,132 @@ fn apply_command(
             } else {
                 project.media.push(media.clone());
             }
-            let errors = project.validate();
-            if errors.is_empty() {
-                Ok(project)
-            } else {
-                Err(ProjectIoError::Invalid(errors))
-            }
+            validate_project_state(project)
         }
-        ProjectCommand::AddClip { track_id, clip } => {
-            if !project.media.iter().any(|media| media.id == clip.media_id) {
-                return Err(ProjectIoError::Invalid(vec![ValidationError::new(
-                    format!("unknown media id {}", clip.media_id),
-                )]));
-            }
-            let track = project
-                .tracks
-                .iter_mut()
-                .find(|track| track.id == *track_id)
-                .ok_or_else(|| {
-                    ProjectIoError::Invalid(vec![ValidationError::new(format!(
-                        "unknown track id {track_id}"
-                    ))])
-                })?;
-            track.clips.push(clip.clone());
-            track.clips.sort_by_key(|clip| clip.start_sample);
-            let errors = project.validate();
-            if errors.is_empty() {
-                Ok(project)
-            } else {
-                Err(ProjectIoError::Invalid(errors))
-            }
-        }
+        ProjectCommand::AddClip { track_id, clip } => apply_add_clip(project, track_id, clip),
+        ProjectCommand::SetClipPlacement {
+            clip_id,
+            start_sample,
+            duration_samples,
+        } => apply_set_clip_placement(project, clip_id, *start_sample, *duration_samples),
+        ProjectCommand::RemoveClip { clip_id } => apply_remove_clip(project, clip_id),
         ProjectCommand::SetTrackControls {
             track_id,
             volume_percent,
             muted,
             solo,
-        } => {
-            let track = project
-                .tracks
-                .iter_mut()
-                .find(|track| track.id == *track_id)
-                .ok_or_else(|| {
-                    ProjectIoError::Invalid(vec![ValidationError::new(format!(
-                        "unknown track id {track_id}"
-                    ))])
-                })?;
-            track.volume_percent = *volume_percent;
-            track.muted = *muted;
-            track.solo = *solo;
-            let errors = project.validate();
-            if errors.is_empty() {
-                Ok(project)
-            } else {
-                Err(ProjectIoError::Invalid(errors))
-            }
-        }
+        } => apply_set_track_controls(project, track_id, *volume_percent, *muted, *solo),
         ProjectCommand::CheckoutSnapshot { snapshot_id } => {
             Ok(load_snapshot(project_dir, snapshot_id)?.project)
         }
+    }
+}
+
+fn apply_add_clip(
+    mut project: Project,
+    track_id: &StableId,
+    clip: &Clip,
+) -> Result<Project, ProjectIoError> {
+    if !project.media.iter().any(|media| media.id == clip.media_id) {
+        return Err(ProjectIoError::Invalid(vec![ValidationError::new(
+            format!("unknown media id {}", clip.media_id),
+        )]));
+    }
+    let track = project
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == *track_id)
+        .ok_or_else(|| unknown_track_error(track_id))?;
+    track.clips.push(clip.clone());
+    track.clips.sort_by_key(|clip| clip.start_sample);
+    validate_project_state(project)
+}
+
+fn apply_set_clip_placement(
+    mut project: Project,
+    clip_id: &StableId,
+    start_sample: u64,
+    duration_samples: u64,
+) -> Result<Project, ProjectIoError> {
+    let clip = find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?;
+    clip.start_sample = start_sample;
+    clip.duration_samples = duration_samples;
+    sort_track_clips(&mut project);
+    validate_project_state(project)
+}
+
+fn apply_remove_clip(mut project: Project, clip_id: &StableId) -> Result<Project, ProjectIoError> {
+    let mut removed = false;
+    for track in &mut project.tracks {
+        let clip_count = track.clips.len();
+        track.clips.retain(|clip| clip.id != *clip_id);
+        removed |= track.clips.len() != clip_count;
+    }
+    if removed {
+        validate_project_state(project)
+    } else {
+        Err(unknown_clip_error(clip_id))
+    }
+}
+
+fn apply_set_track_controls(
+    mut project: Project,
+    track_id: &StableId,
+    volume_percent: u16,
+    muted: bool,
+    solo: bool,
+) -> Result<Project, ProjectIoError> {
+    let track = project
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == *track_id)
+        .ok_or_else(|| unknown_track_error(track_id))?;
+    track.volume_percent = volume_percent;
+    track.muted = muted;
+    track.solo = solo;
+    validate_project_state(project)
+}
+
+fn validate_project_state(project: Project) -> Result<Project, ProjectIoError> {
+    let errors = project.validate();
+    if errors.is_empty() {
+        Ok(project)
+    } else {
+        Err(ProjectIoError::Invalid(errors))
+    }
+}
+
+fn unknown_track_error(track_id: &StableId) -> ProjectIoError {
+    ProjectIoError::Invalid(vec![ValidationError::new(format!(
+        "unknown track id {track_id}"
+    ))])
+}
+
+fn unknown_clip_error(clip_id: &StableId) -> ProjectIoError {
+    ProjectIoError::Invalid(vec![ValidationError::new(format!(
+        "unknown clip id {clip_id}"
+    ))])
+}
+
+fn find_clip<'a>(project: &'a Project, clip_id: &StableId) -> Option<&'a Clip> {
+    project
+        .tracks
+        .iter()
+        .flat_map(|track| &track.clips)
+        .find(|clip| clip.id == *clip_id)
+}
+
+fn find_clip_mut<'a>(project: &'a mut Project, clip_id: &StableId) -> Option<&'a mut Clip> {
+    project
+        .tracks
+        .iter_mut()
+        .flat_map(|track| &mut track.clips)
+        .find(|clip| clip.id == *clip_id)
+}
+
+fn sort_track_clips(project: &mut Project) {
+    for track in &mut project.tracks {
+        track.clips.sort_by_key(|clip| clip.start_sample);
     }
 }
 
@@ -1130,8 +1280,8 @@ mod tests {
     use super::{
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
-        project_file_path, replay_project, set_track_controls, switch_branch, Project,
-        ProjectIoError, StableId, Track, PROJECT_SCHEMA_VERSION,
+        project_file_path, remove_clip, replay_project, set_clip_placement, set_track_controls,
+        switch_branch, Project, ProjectIoError, StableId, Track, PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1291,6 +1441,33 @@ mod tests {
         assert!(updated.muted);
         assert!(!updated.solo);
         assert_eq!(project.tracks[0], updated);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn edits_and_removes_clips_through_command_log() {
+        let project_dir = temp_project_dir("clip-edit");
+        init_project(&project_dir, "Clip Edits").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let first_clip =
+            add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add first clip");
+        let second_clip =
+            add_clip(&project_dir, &track.id, &media.id, 96_000, 12_000).expect("add second clip");
+
+        let edited =
+            set_clip_placement(&project_dir, &second_clip.id, 12_000, 36_000).expect("edit clip");
+        let removed = remove_clip(&project_dir, &first_clip.id).expect("remove clip");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(edited.start_sample, 12_000);
+        assert_eq!(edited.duration_samples, 36_000);
+        assert_eq!(removed, first_clip);
+        assert_eq!(project.tracks[0].clips, vec![edited]);
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");
