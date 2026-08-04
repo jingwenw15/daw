@@ -23,6 +23,9 @@ struct DawApp {
     edit_clip_id: String,
     edit_clip_start_sample: String,
     edit_clip_duration_samples: String,
+    recording_track_id: String,
+    recording_duration_seconds: String,
+    recording_start_sample: String,
     mixer_track_id: String,
     mixer_volume_percent: String,
     mixer_muted: bool,
@@ -49,6 +52,9 @@ impl Default for DawApp {
             edit_clip_id: String::new(),
             edit_clip_start_sample: "0".to_owned(),
             edit_clip_duration_samples: "48000".to_owned(),
+            recording_track_id: String::new(),
+            recording_duration_seconds: "1.0".to_owned(),
+            recording_start_sample: "0".to_owned(),
             mixer_track_id: String::new(),
             mixer_volume_percent: "100".to_owned(),
             mixer_muted: false,
@@ -103,85 +109,126 @@ impl DawApp {
             .default_width(280.0)
             .show(ctx, |ui| {
                 ui.heading("Project");
-                ui.label("New project name");
-                ui.text_edit_singleline(&mut self.new_project_name);
-                ui.separator();
-                ui.label("New track");
-                ui.text_edit_singleline(&mut self.new_track_name);
-                if ui.button("Add Track").clicked() {
-                    self.add_track();
-                }
-                ui.separator();
-                ui.label("Media source path");
-                ui.text_edit_singleline(&mut self.media_source_path);
-                if ui.button("Import Media").clicked() {
-                    self.import_media();
-                }
-                ui.separator();
-                ui.label("Clip track id");
-                ui.text_edit_singleline(&mut self.clip_track_id);
-                ui.label("Clip media id");
-                ui.text_edit_singleline(&mut self.clip_media_id);
-                ui.horizontal(|ui| {
-                    ui.label("Start");
-                    ui.text_edit_singleline(&mut self.clip_start_sample);
-                    ui.label("Duration");
-                    ui.text_edit_singleline(&mut self.clip_duration_samples);
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Use First IDs").clicked() {
-                        self.use_first_clip_ids();
-                    }
-                    if ui.button("Add Clip").clicked() {
-                        self.add_clip();
-                    }
-                });
-                ui.separator();
-                ui.label("Edit clip id");
-                ui.text_edit_singleline(&mut self.edit_clip_id);
-                ui.horizontal(|ui| {
-                    ui.label("Start");
-                    ui.text_edit_singleline(&mut self.edit_clip_start_sample);
-                    ui.label("Duration");
-                    ui.text_edit_singleline(&mut self.edit_clip_duration_samples);
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Use First Clip").clicked() {
-                        self.use_first_clip();
-                    }
-                    if ui.button("Move Clip").clicked() {
-                        self.move_clip();
-                    }
-                    if ui.button("Remove Clip").clicked() {
-                        self.remove_clip();
-                    }
-                });
-                ui.separator();
-                ui.label("Snapshot message");
-                ui.text_edit_singleline(&mut self.snapshot_message);
-                if ui.button("Create Snapshot").clicked() {
-                    self.create_snapshot();
-                }
-                ui.separator();
-                ui.label("Mixer track id");
-                ui.text_edit_singleline(&mut self.mixer_track_id);
-                ui.label("Volume percent");
-                ui.text_edit_singleline(&mut self.mixer_volume_percent);
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.mixer_muted, "Muted");
-                    ui.checkbox(&mut self.mixer_solo, "Solo");
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Use First Track").clicked() {
-                        self.use_first_mixer_track();
-                    }
-                    if ui.button("Set Controls").clicked() {
-                        self.set_track_controls();
-                    }
-                });
+                self.render_project_edit_section(ui);
+                self.render_media_clip_section(ui);
+                self.render_clip_edit_section(ui);
+                self.render_snapshot_section(ui);
+                self.render_recording_section(ui);
+                self.render_mixer_section(ui);
                 ui.separator();
                 ui.label(&self.status);
             });
+    }
+
+    fn render_project_edit_section(&mut self, ui: &mut egui::Ui) {
+        ui.label("New project name");
+        ui.text_edit_singleline(&mut self.new_project_name);
+        ui.separator();
+        ui.label("New track");
+        ui.text_edit_singleline(&mut self.new_track_name);
+        if ui.button("Add Track").clicked() {
+            self.add_track();
+        }
+        ui.separator();
+    }
+
+    fn render_media_clip_section(&mut self, ui: &mut egui::Ui) {
+        ui.label("Media source path");
+        ui.text_edit_singleline(&mut self.media_source_path);
+        if ui.button("Import Media").clicked() {
+            self.import_media();
+        }
+        ui.separator();
+        ui.label("Clip track id");
+        ui.text_edit_singleline(&mut self.clip_track_id);
+        ui.label("Clip media id");
+        ui.text_edit_singleline(&mut self.clip_media_id);
+        ui.horizontal(|ui| {
+            ui.label("Start");
+            ui.text_edit_singleline(&mut self.clip_start_sample);
+            ui.label("Duration");
+            ui.text_edit_singleline(&mut self.clip_duration_samples);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Use First IDs").clicked() {
+                self.use_first_clip_ids();
+            }
+            if ui.button("Add Clip").clicked() {
+                self.add_clip();
+            }
+        });
+        ui.separator();
+    }
+
+    fn render_clip_edit_section(&mut self, ui: &mut egui::Ui) {
+        ui.label("Edit clip id");
+        ui.text_edit_singleline(&mut self.edit_clip_id);
+        ui.horizontal(|ui| {
+            ui.label("Start");
+            ui.text_edit_singleline(&mut self.edit_clip_start_sample);
+            ui.label("Duration");
+            ui.text_edit_singleline(&mut self.edit_clip_duration_samples);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Use First Clip").clicked() {
+                self.use_first_clip();
+            }
+            if ui.button("Move Clip").clicked() {
+                self.move_clip();
+            }
+            if ui.button("Remove Clip").clicked() {
+                self.remove_clip();
+            }
+        });
+        ui.separator();
+    }
+
+    fn render_snapshot_section(&mut self, ui: &mut egui::Ui) {
+        ui.label("Snapshot message");
+        ui.text_edit_singleline(&mut self.snapshot_message);
+        if ui.button("Create Snapshot").clicked() {
+            self.create_snapshot();
+        }
+        ui.separator();
+    }
+
+    fn render_recording_section(&mut self, ui: &mut egui::Ui) {
+        ui.label("Recording track id");
+        ui.text_edit_singleline(&mut self.recording_track_id);
+        ui.horizontal(|ui| {
+            ui.label("Seconds");
+            ui.text_edit_singleline(&mut self.recording_duration_seconds);
+            ui.label("Start");
+            ui.text_edit_singleline(&mut self.recording_start_sample);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Use First Track").clicked() {
+                self.use_first_recording_track();
+            }
+            if ui.button("Record Snippet").clicked() {
+                self.record_snippet();
+            }
+        });
+        ui.separator();
+    }
+
+    fn render_mixer_section(&mut self, ui: &mut egui::Ui) {
+        ui.label("Mixer track id");
+        ui.text_edit_singleline(&mut self.mixer_track_id);
+        ui.label("Volume percent");
+        ui.text_edit_singleline(&mut self.mixer_volume_percent);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.mixer_muted, "Muted");
+            ui.checkbox(&mut self.mixer_solo, "Solo");
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Use First Track").clicked() {
+                self.use_first_mixer_track();
+            }
+            if ui.button("Set Controls").clicked() {
+                self.set_track_controls();
+            }
+        });
     }
 
     fn render_project(&self, ctx: &egui::Context) {
@@ -250,6 +297,7 @@ impl DawApp {
                 self.status = format!("Added track '{}'", track.name);
                 self.clip_track_id = track.id.to_string();
                 self.mixer_track_id = track.id.to_string();
+                self.recording_track_id = track.id.to_string();
                 self.reload_project();
             }
             Err(error) => self.status = format!("Add track failed: {error}"),
@@ -286,6 +334,7 @@ impl DawApp {
             let media_id = project.media.first().map(|media| media.id.to_string());
             if let Some(track) = track {
                 self.clip_track_id = track.id.to_string();
+                self.recording_track_id = track.id.to_string();
                 self.set_mixer_fields_from_track(&track);
             }
             if let Some(media_id) = media_id {
@@ -359,6 +408,52 @@ impl DawApp {
                 self.reload_auxiliary();
             }
             Err(error) => self.status = format!("Snapshot failed: {error}"),
+        }
+    }
+
+    fn use_first_recording_track(&mut self) {
+        let track_id = self
+            .project
+            .as_ref()
+            .and_then(|project| project.tracks.first())
+            .map(|track| track.id.to_string());
+        if let Some(track_id) = track_id {
+            self.recording_track_id = track_id;
+            "Selected first recording track".clone_into(&mut self.status);
+        } else if self.project.is_some() {
+            "Project has no tracks".clone_into(&mut self.status);
+        } else {
+            "Open a project before selecting a recording track".clone_into(&mut self.status);
+        }
+    }
+
+    fn record_snippet(&mut self) {
+        let duration = match parse_f32(&self.recording_duration_seconds, "recording duration") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let start_sample = match parse_u64(&self.recording_start_sample, "recording start") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let path = PathBuf::from(&self.project_path);
+        match record_snippet_into_project(
+            &path,
+            &daw_model::StableId::from_string(self.recording_track_id.clone()),
+            duration,
+            start_sample,
+        ) {
+            Ok(report) => {
+                self.status = report;
+                self.reload_project();
+            }
+            Err(error) => self.status = format!("Record failed: {error}"),
         }
     }
 
@@ -630,12 +725,13 @@ fn mix_clip_from_project(
         daw_media::media_object_path(project_path, &object.hash, object.extension.as_deref());
     let decoded = daw_engine::read_wav(&path)
         .map_err(|error| format!("Failed to read media {hash}: {error}"))?;
-    if decoded.sample_rate != output.sample_rate || decoded.channels != output.channels {
+    if decoded.sample_rate != output.sample_rate {
         return Err(format!(
-            "Media {hash} is {} Hz/{} channels; expected {} Hz/{} channels",
-            decoded.sample_rate, decoded.channels, output.sample_rate, output.channels
+            "Media {hash} is {} Hz; expected {} Hz",
+            decoded.sample_rate, output.sample_rate
         ));
     }
+    let decoded = daw_engine::convert_channels(&decoded, output.channels);
     let limited = limit_buffer_frames(
         &decoded,
         usize::try_from(clip.duration_samples)
@@ -671,6 +767,54 @@ fn parse_u16(value: &str, label: &str) -> Result<u16, String> {
     value
         .parse::<u16>()
         .map_err(|error| format!("Invalid {label}: {error}"))
+}
+
+fn parse_f32(value: &str, label: &str) -> Result<f32, String> {
+    value
+        .parse::<f32>()
+        .map_err(|error| format!("Invalid {label}: {error}"))
+}
+
+fn record_snippet_into_project(
+    project_path: &Path,
+    track_id: &daw_model::StableId,
+    duration_seconds: f32,
+    start_sample: u64,
+) -> Result<String, String> {
+    let recorded = daw_engine::record_input(duration_seconds)
+        .map_err(|error| format!("input capture failed: {error}"))?;
+    let output_path = recording_output_path(project_path, recorded.report.frames_recorded);
+    daw_engine::write_wav(&output_path, &recorded.buffer)
+        .map_err(|error| format!("recording write failed: {error}"))?;
+    let object = daw_media::import_media(project_path, &output_path)
+        .map_err(|error| format!("recording import failed: {error}"))?;
+    let media =
+        daw_model::add_media_reference(project_path, &object.hash, Some(object.original_path))
+            .map_err(|error| format!("recording registration failed: {error}"))?;
+    let duration_samples = u64::try_from(recorded.buffer.frames())
+        .map_err(|_| "recording is too long for the project model".to_owned())?;
+    let clip = daw_model::add_clip(
+        project_path,
+        track_id,
+        &media.id,
+        start_sample,
+        duration_samples,
+    )
+    .map_err(|error| format!("recorded clip insert failed: {error}"))?;
+
+    Ok(format!(
+        "Recorded {} frames from '{}' into clip {}",
+        recorded.report.frames_recorded, recorded.report.device_name, clip.id
+    ))
+}
+
+fn recording_output_path(project_path: &Path, frames_recorded: usize) -> PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    project_path
+        .join("recordings")
+        .join(format!("recording-{timestamp}-{frames_recorded}.wav"))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

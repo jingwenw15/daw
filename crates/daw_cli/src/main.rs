@@ -1,6 +1,6 @@
 //! Command-line entrypoint for the DAW.
 
-use std::{env, process::ExitCode};
+use std::{env, path::PathBuf, process::ExitCode};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -65,6 +65,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some("render-project") => run_render_project(args),
         Some("play-project") => run_play_project(args),
         Some("play-test-tone") => run_play_test_tone(args),
+        Some("record-snippet") => run_record_snippet(args),
         Some("history") => {
             let path = required_arg(&mut args, "path")?;
             no_extra_args(args)?;
@@ -89,6 +90,51 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             "unknown command: {command}\nrun `daw --help` for usage"
         )),
     }
+}
+
+fn run_record_snippet(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let project_path = required_arg(&mut args, "path")?;
+    let track_id = required_arg(&mut args, "track-id")?;
+    let duration = optional_f32(args.next(), 1.0, "duration-seconds")?;
+    let start_sample = optional_u64(args.next(), 0, "start-sample")?;
+    no_extra_args(args)?;
+
+    let recorded = daw_engine::record_input(duration)
+        .map_err(|error| format!("failed to record snippet: {error}"))?;
+    let output_path = recording_output_path(&project_path, recorded.report.frames_recorded);
+    daw_engine::write_wav(&output_path, &recorded.buffer)
+        .map_err(|error| format!("failed to write recording: {error}"))?;
+    let object = daw_media::import_media(project_path.as_ref(), &output_path)
+        .map_err(|error| format!("failed to import recording: {error}"))?;
+    let media = daw_model::add_media_reference(
+        project_path.as_ref(),
+        &object.hash,
+        Some(object.original_path.clone()),
+    )
+    .map_err(|error| format!("failed to register recording media: {error}"))?;
+    let duration_samples = u64::try_from(recorded.buffer.frames())
+        .map_err(|_| "recording is too long for the project model".to_owned())?;
+    let clip = daw_model::add_clip(
+        project_path.as_ref(),
+        &daw_model::StableId::from_string(track_id),
+        &media.id,
+        start_sample,
+        duration_samples,
+    )
+    .map_err(|error| format!("failed to add recorded clip: {error}"))?;
+
+    println!(
+        "recorded {} frames from '{}' at {} Hz, {} channels",
+        recorded.report.frames_recorded,
+        recorded.report.device_name,
+        recorded.report.sample_rate,
+        recorded.report.channels
+    );
+    println!("stream errors: {}", recorded.report.stream_errors);
+    println!("recording file: {}", output_path.display());
+    println!("media id: {}", media.id);
+    println!("clip id: {}", clip.id);
+    Ok(())
 }
 
 fn run_play_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -596,12 +642,13 @@ fn render_project_buffer(
             );
             let decoded = daw_engine::read_wav(&path)
                 .map_err(|error| format!("failed to read media {hash}: {error}"))?;
-            if decoded.sample_rate != output.sample_rate || decoded.channels != output.channels {
+            if decoded.sample_rate != output.sample_rate {
                 return Err(format!(
-                    "media {hash} is {} Hz/{} channels; expected {} Hz/{} channels",
-                    decoded.sample_rate, decoded.channels, output.sample_rate, output.channels
+                    "media {hash} is {} Hz; expected {} Hz",
+                    decoded.sample_rate, output.sample_rate
                 ));
             }
+            let decoded = daw_engine::convert_channels(&decoded, output.channels);
             let limited = limit_buffer_frames(
                 &decoded,
                 usize::try_from(clip.duration_samples)
@@ -664,6 +711,7 @@ fn print_help() {
     println!("  daw render-project <path> <output> [duration-seconds]");
     println!("  daw play-test-tone [duration-seconds]");
     println!("  daw play-project <path> [minimum-duration-seconds]");
+    println!("  daw record-snippet <path> <track-id> [duration-seconds] [start-sample]");
     println!("  daw diff <path> <left-ref> <right-ref>");
     println!("  daw merge <path> <source-branch>");
     println!("  daw history <path>");
@@ -680,6 +728,14 @@ fn optional_f32(value: Option<String>, default: f32, name: &str) -> Result<f32, 
     value.map_or(Ok(default), |value| {
         value
             .parse::<f32>()
+            .map_err(|error| format!("invalid {name}: {error}"))
+    })
+}
+
+fn optional_u64(value: Option<String>, default: u64, name: &str) -> Result<u64, String> {
+    value.map_or(Ok(default), |value| {
+        value
+            .parse::<u64>()
             .map_err(|error| format!("invalid {name}: {error}"))
     })
 }
@@ -733,6 +789,15 @@ fn default_project_name(path: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("Untitled")
         .to_owned()
+}
+
+fn recording_output_path(project_path: &str, frames_recorded: usize) -> PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    std::path::Path::new(project_path)
+        .join("recordings")
+        .join(format!("recording-{timestamp}-{frames_recorded}.wav"))
 }
 
 #[cfg(test)]

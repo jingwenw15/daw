@@ -8,7 +8,7 @@ use std::{f64::consts::TAU, fmt, fs, io, path::Path};
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -60,6 +60,30 @@ pub struct PlaybackReport {
     pub stream_errors: u32,
 }
 
+/// Summary returned with a captured input buffer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordingReport {
+    /// Input device name.
+    pub device_name: String,
+    /// Stream sample rate.
+    pub sample_rate: u32,
+    /// Stream channel count.
+    pub channels: u16,
+    /// Frames captured into the buffer.
+    pub frames_recorded: usize,
+    /// Stream error callback count.
+    pub stream_errors: u32,
+}
+
+/// Captured input audio and device metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedAudio {
+    /// Recorded samples.
+    pub buffer: AudioBuffer,
+    /// Capture report.
+    pub report: RecordingReport,
+}
+
 /// Handle for an active real-time playback stream.
 pub struct PlaybackTransport {
     stream: Option<cpal::Stream>,
@@ -85,6 +109,23 @@ pub enum PlaybackError {
     PlayStream(String),
     /// Render settings are invalid.
     Render(RenderError),
+}
+
+/// Error returned by real-time recording.
+#[derive(Debug)]
+pub enum RecordingError {
+    /// No default input device is available.
+    NoInputDevice,
+    /// Backend failed to provide a default stream config.
+    DefaultConfig(String),
+    /// Backend failed to build the stream.
+    BuildStream(String),
+    /// Backend failed to start the stream.
+    PlayStream(String),
+    /// Render settings are invalid.
+    Render(RenderError),
+    /// Internal capture buffer could not be read.
+    BufferUnavailable,
 }
 
 /// Render a deterministic sine test tone.
@@ -236,6 +277,89 @@ pub fn start_buffer_playback(buffer: AudioBuffer) -> Result<PlaybackTransport, P
     })
 }
 
+/// Record a fixed-duration snippet from the default input device.
+///
+/// # Errors
+///
+/// Returns an error if no input device exists, the input stream cannot be built
+/// or started, or the duration is invalid.
+pub fn record_input(duration_seconds: f32) -> Result<RecordedAudio, RecordingError> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or(RecordingError::NoInputDevice)?;
+    let device_name = device.name().unwrap_or_else(|_| "default input".to_owned());
+    let supported_config = device
+        .default_input_config()
+        .map_err(|error| RecordingError::DefaultConfig(error.to_string()))?;
+    let sample_rate = supported_config.sample_rate().0;
+    let channels = supported_config.channels();
+    validate_render_settings(duration_seconds, sample_rate, channels)?;
+
+    let target_samples = frames_for_duration(duration_seconds, sample_rate) * usize::from(channels);
+    let samples = Arc::new(Mutex::new(Vec::<f32>::with_capacity(target_samples)));
+    let samples_written = Arc::new(AtomicUsize::new(0));
+    let stream_errors = Arc::new(AtomicU32::new(0));
+    let stream_config = supported_config.config();
+
+    let stream = match supported_config.sample_format() {
+        cpal::SampleFormat::F32 => build_recording_stream::<f32>(
+            &device,
+            &stream_config,
+            Arc::clone(&samples),
+            Arc::clone(&samples_written),
+            target_samples,
+            &stream_errors,
+        ),
+        cpal::SampleFormat::I16 => build_recording_stream::<i16>(
+            &device,
+            &stream_config,
+            Arc::clone(&samples),
+            Arc::clone(&samples_written),
+            target_samples,
+            &stream_errors,
+        ),
+        cpal::SampleFormat::U16 => build_recording_stream::<u16>(
+            &device,
+            &stream_config,
+            Arc::clone(&samples),
+            Arc::clone(&samples_written),
+            target_samples,
+            &stream_errors,
+        ),
+        format => Err(RecordingError::BuildStream(format!(
+            "unsupported sample format: {format:?}"
+        ))),
+    }?;
+
+    stream
+        .play()
+        .map_err(|error| RecordingError::PlayStream(error.to_string()))?;
+    while samples_written.load(Ordering::Relaxed) < target_samples {
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(stream);
+
+    let samples = Arc::try_unwrap(samples)
+        .map_err(|_| RecordingError::BufferUnavailable)?
+        .into_inner()
+        .map_err(|_| RecordingError::BufferUnavailable)?;
+    let buffer = AudioBuffer {
+        sample_rate,
+        channels,
+        samples,
+    };
+    let report = RecordingReport {
+        device_name,
+        sample_rate,
+        channels,
+        frames_recorded: buffer.frames(),
+        stream_errors: stream_errors.load(Ordering::Relaxed),
+    };
+
+    Ok(RecordedAudio { buffer, report })
+}
+
 /// Read a 16-bit PCM WAV file into an audio buffer.
 ///
 /// # Errors
@@ -273,6 +397,31 @@ pub fn mix_clip(
                 + clip.samples[clip_index] * gain)
                 .clamp(-1.0, 1.0);
         }
+    }
+}
+
+/// Convert an audio buffer to a different channel count.
+#[must_use]
+pub fn convert_channels(buffer: &AudioBuffer, channels: u16) -> AudioBuffer {
+    if buffer.channels == channels {
+        return buffer.clone();
+    }
+
+    let source_channels = usize::from(buffer.channels);
+    let destination_channels = usize::from(channels);
+    let mut samples = Vec::with_capacity(buffer.frames() * destination_channels);
+    for frame in 0..buffer.frames() {
+        for channel in 0..destination_channels {
+            let source_channel = channel.min(source_channels.saturating_sub(1));
+            let sample = buffer.samples[frame * source_channels + source_channel];
+            samples.push(sample);
+        }
+    }
+
+    AudioBuffer {
+        sample_rate: buffer.sample_rate,
+        channels,
+        samples,
     }
 }
 
@@ -417,6 +566,19 @@ impl fmt::Display for PlaybackError {
     }
 }
 
+impl fmt::Display for RecordingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoInputDevice => formatter.write_str("no default input device available"),
+            Self::DefaultConfig(message)
+            | Self::BuildStream(message)
+            | Self::PlayStream(message) => formatter.write_str(message),
+            Self::Render(error) => write!(formatter, "{error}"),
+            Self::BufferUnavailable => formatter.write_str("recording buffer is unavailable"),
+        }
+    }
+}
+
 impl std::error::Error for PlaybackError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -432,6 +594,25 @@ impl std::error::Error for PlaybackError {
 impl From<RenderError> for PlaybackError {
     fn from(error: RenderError) -> Self {
         Self::Render(error)
+    }
+}
+
+impl From<RenderError> for RecordingError {
+    fn from(error: RenderError) -> Self {
+        Self::Render(error)
+    }
+}
+
+impl std::error::Error for RecordingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Render(error) => Some(error),
+            Self::NoInputDevice
+            | Self::DefaultConfig(_)
+            | Self::BuildStream(_)
+            | Self::PlayStream(_)
+            | Self::BufferUnavailable => None,
+        }
     }
 }
 
@@ -531,6 +712,57 @@ where
             None,
         )
         .map_err(|error| PlaybackError::BuildStream(error.to_string()))
+}
+
+fn build_recording_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    samples: Arc<Mutex<Vec<f32>>>,
+    samples_written: Arc<AtomicUsize>,
+    target_samples: usize,
+    stream_errors: &Arc<AtomicU32>,
+) -> Result<cpal::Stream, RecordingError>
+where
+    T: Sample + cpal::SizedSample,
+    f32: FromSample<T>,
+{
+    let error_counter = Arc::clone(stream_errors);
+    device
+        .build_input_stream(
+            config,
+            move |input: &[T], _| {
+                write_recording_data(input, &samples, &samples_written, target_samples);
+            },
+            move |_| {
+                error_counter.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        )
+        .map_err(|error| RecordingError::BuildStream(error.to_string()))
+}
+
+fn write_recording_data<T>(
+    input: &[T],
+    samples: &Mutex<Vec<f32>>,
+    samples_written: &AtomicUsize,
+    target_samples: usize,
+) where
+    T: Sample,
+    f32: FromSample<T>,
+{
+    if samples_written.load(Ordering::Relaxed) >= target_samples {
+        return;
+    }
+    let Ok(mut samples) = samples.lock() else {
+        return;
+    };
+    for sample in input {
+        if samples.len() >= target_samples {
+            break;
+        }
+        samples.push(f32::from_sample(*sample));
+    }
+    samples_written.store(samples.len(), Ordering::Relaxed);
 }
 
 fn write_playback_data<T>(
@@ -643,8 +875,8 @@ fn parse_pcm16_wav(bytes: &[u8]) -> Result<AudioBuffer, RenderError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        mix_clip, read_wav, render_silence, render_sine, write_wav, AudioBuffer, DEFAULT_CHANNELS,
-        DEFAULT_SAMPLE_RATE,
+        convert_channels, mix_clip, read_wav, render_silence, render_sine, write_wav, AudioBuffer,
+        DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE,
     };
     use std::{fs, path::PathBuf};
 
@@ -709,6 +941,20 @@ mod tests {
         assert_eq!(decoded.frames(), clip.frames());
         assert!(destination.samples.iter().any(|sample| sample.abs() > 0.0));
         fs::remove_file(output).expect("cleanup");
+    }
+
+    #[test]
+    fn converts_mono_to_stereo() {
+        let mono = AudioBuffer {
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            channels: 1,
+            samples: vec![0.25, -0.25],
+        };
+
+        let stereo = convert_channels(&mono, 2);
+
+        assert_eq!(stereo.channels, 2);
+        assert_eq!(stereo.samples, vec![0.25, 0.25, -0.25, -0.25]);
     }
 
     fn temp_file(name: &str) -> PathBuf {

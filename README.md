@@ -156,3 +156,15 @@ cargo run --bin daw -- clip move /tmp/my-session <clip-id> 12000 36000
 cargo run --bin daw -- clip remove /tmp/my-session <clip-id>
 cargo run --bin daw-ui
 ```
+
+## Stage 14
+
+The engine can record a fixed-duration snippet from the default input device.
+The CLI and UI write the recording as a WAV file, import it into the
+content-addressed media store, register it in the project, and add it as a
+timeline clip.
+
+```sh
+cargo run --bin daw -- record-snippet /tmp/my-session <track-id> 2.0 0
+cargo run --bin daw-ui
+```
