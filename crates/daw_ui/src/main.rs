@@ -24,7 +24,6 @@ struct DawApp {
     edit_clip_start_sample: String,
     edit_clip_duration_samples: String,
     recording_track_id: String,
-    recording_duration_seconds: String,
     recording_start_sample: String,
     mixer_track_id: String,
     mixer_volume_percent: String,
@@ -36,6 +35,13 @@ struct DawApp {
     media: Vec<daw_media::MediaObject>,
     history: Vec<daw_model::HistoryItem>,
     transport: Option<daw_engine::PlaybackTransport>,
+    recording: Option<ActiveRecording>,
+}
+
+struct ActiveRecording {
+    transport: daw_engine::RecordingTransport,
+    track_id: daw_model::StableId,
+    start_sample: u64,
 }
 
 impl Default for DawApp {
@@ -53,7 +59,6 @@ impl Default for DawApp {
             edit_clip_start_sample: "0".to_owned(),
             edit_clip_duration_samples: "48000".to_owned(),
             recording_track_id: String::new(),
-            recording_duration_seconds: "1.0".to_owned(),
             recording_start_sample: "0".to_owned(),
             mixer_track_id: String::new(),
             mixer_volume_percent: "100".to_owned(),
@@ -65,6 +70,7 @@ impl Default for DawApp {
             media: Vec::new(),
             history: Vec::new(),
             transport: None,
+            recording: None,
         }
     }
 }
@@ -196,8 +202,6 @@ impl DawApp {
         ui.label("Recording track id");
         ui.text_edit_singleline(&mut self.recording_track_id);
         ui.horizontal(|ui| {
-            ui.label("Seconds");
-            ui.text_edit_singleline(&mut self.recording_duration_seconds);
             ui.label("Start");
             ui.text_edit_singleline(&mut self.recording_start_sample);
         });
@@ -205,8 +209,11 @@ impl DawApp {
             if ui.button("Use First Track").clicked() {
                 self.use_first_recording_track();
             }
-            if ui.button("Record Snippet").clicked() {
-                self.record_snippet();
+            if ui.button("Start Record").clicked() {
+                self.start_recording();
+            }
+            if ui.button("Stop Record").clicked() {
+                self.stop_recording();
             }
         });
         ui.separator();
@@ -427,14 +434,11 @@ impl DawApp {
         }
     }
 
-    fn record_snippet(&mut self) {
-        let duration = match parse_f32(&self.recording_duration_seconds, "recording duration") {
-            Ok(value) => value,
-            Err(error) => {
-                self.status = error;
-                return;
-            }
-        };
+    fn start_recording(&mut self) {
+        if self.recording.is_some() {
+            "Already recording".clone_into(&mut self.status);
+            return;
+        }
         let start_sample = match parse_u64(&self.recording_start_sample, "recording start") {
             Ok(value) => value,
             Err(error) => {
@@ -442,18 +446,38 @@ impl DawApp {
                 return;
             }
         };
-        let path = PathBuf::from(&self.project_path);
-        match record_snippet_into_project(
-            &path,
-            &daw_model::StableId::from_string(self.recording_track_id.clone()),
-            duration,
-            start_sample,
-        ) {
-            Ok(report) => {
-                self.status = report;
-                self.reload_project();
+        match daw_engine::start_input_recording() {
+            Ok(transport) => {
+                self.status = format!("Recording from '{}'", transport.report().device_name);
+                self.recording = Some(ActiveRecording {
+                    transport,
+                    track_id: daw_model::StableId::from_string(self.recording_track_id.clone()),
+                    start_sample,
+                });
             }
-            Err(error) => self.status = format!("Record failed: {error}"),
+            Err(error) => self.status = format!("Record start failed: {error}"),
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(mut recording) = self.recording.take() else {
+            "Nothing is recording".clone_into(&mut self.status);
+            return;
+        };
+        match recording.transport.stop() {
+            Ok(recorded) => match insert_recorded_audio(
+                Path::new(&self.project_path),
+                &recording.track_id,
+                recording.start_sample,
+                &recorded,
+            ) {
+                Ok(report) => {
+                    self.status = report;
+                    self.reload_project();
+                }
+                Err(error) => self.status = format!("Record insert failed: {error}"),
+            },
+            Err(error) => self.status = format!("Record stop failed: {error}"),
         }
     }
 
@@ -769,20 +793,12 @@ fn parse_u16(value: &str, label: &str) -> Result<u16, String> {
         .map_err(|error| format!("Invalid {label}: {error}"))
 }
 
-fn parse_f32(value: &str, label: &str) -> Result<f32, String> {
-    value
-        .parse::<f32>()
-        .map_err(|error| format!("Invalid {label}: {error}"))
-}
-
-fn record_snippet_into_project(
+fn insert_recorded_audio(
     project_path: &Path,
     track_id: &daw_model::StableId,
-    duration_seconds: f32,
     start_sample: u64,
+    recorded: &daw_engine::RecordedAudio,
 ) -> Result<String, String> {
-    let recorded = daw_engine::record_input(duration_seconds)
-        .map_err(|error| format!("input capture failed: {error}"))?;
     let output_path = recording_output_path(project_path, recorded.report.frames_recorded);
     daw_engine::write_wav(&output_path, &recorded.buffer)
         .map_err(|error| format!("recording write failed: {error}"))?;

@@ -96,6 +96,19 @@ pub struct PlaybackTransport {
     total_samples: usize,
 }
 
+/// Handle for an active real-time recording stream.
+pub struct RecordingTransport {
+    stream: Option<cpal::Stream>,
+    device_name: String,
+    sample_rate: u32,
+    channels: u16,
+    samples: Arc<Mutex<Vec<f32>>>,
+    samples_written: Arc<AtomicUsize>,
+    stream_errors: Arc<AtomicU32>,
+    stop_requested: Arc<AtomicBool>,
+    target_samples: Option<usize>,
+}
+
 /// Error returned by real-time playback.
 #[derive(Debug)]
 pub enum PlaybackError {
@@ -284,6 +297,29 @@ pub fn start_buffer_playback(buffer: AudioBuffer) -> Result<PlaybackTransport, P
 /// Returns an error if no input device exists, the input stream cannot be built
 /// or started, or the duration is invalid.
 pub fn record_input(duration_seconds: f32) -> Result<RecordedAudio, RecordingError> {
+    let mut transport = start_limited_input_recording(duration_seconds)?;
+    while !transport.is_finished() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    transport.stop()
+}
+
+/// Start recording from the default input device.
+///
+/// The returned transport owns the native input stream. Calling `stop` finalizes
+/// the captured buffer.
+///
+/// # Errors
+///
+/// Returns an error if no input device exists, the input stream cannot be built
+/// or started.
+pub fn start_input_recording() -> Result<RecordingTransport, RecordingError> {
+    start_input_recording_with_limit(None)
+}
+
+fn start_limited_input_recording(
+    duration_seconds: f32,
+) -> Result<RecordingTransport, RecordingError> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -295,35 +331,70 @@ pub fn record_input(duration_seconds: f32) -> Result<RecordedAudio, RecordingErr
     let sample_rate = supported_config.sample_rate().0;
     let channels = supported_config.channels();
     validate_render_settings(duration_seconds, sample_rate, channels)?;
-
     let target_samples = frames_for_duration(duration_seconds, sample_rate) * usize::from(channels);
-    let samples = Arc::new(Mutex::new(Vec::<f32>::with_capacity(target_samples)));
+    start_input_recording_from_config(
+        &device,
+        device_name,
+        &supported_config,
+        Some(target_samples),
+    )
+}
+
+fn start_input_recording_with_limit(
+    target_samples: Option<usize>,
+) -> Result<RecordingTransport, RecordingError> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or(RecordingError::NoInputDevice)?;
+    let device_name = device.name().unwrap_or_else(|_| "default input".to_owned());
+    let supported_config = device
+        .default_input_config()
+        .map_err(|error| RecordingError::DefaultConfig(error.to_string()))?;
+    start_input_recording_from_config(&device, device_name, &supported_config, target_samples)
+}
+
+fn start_input_recording_from_config(
+    device: &cpal::Device,
+    device_name: String,
+    supported_config: &cpal::SupportedStreamConfig,
+    target_samples: Option<usize>,
+) -> Result<RecordingTransport, RecordingError> {
+    let sample_rate = supported_config.sample_rate().0;
+    let channels = supported_config.channels();
+    let samples = Arc::new(Mutex::new(Vec::<f32>::with_capacity(
+        target_samples.unwrap_or(0),
+    )));
     let samples_written = Arc::new(AtomicUsize::new(0));
     let stream_errors = Arc::new(AtomicU32::new(0));
+    let stop_requested = Arc::new(AtomicBool::new(false));
     let stream_config = supported_config.config();
 
     let stream = match supported_config.sample_format() {
         cpal::SampleFormat::F32 => build_recording_stream::<f32>(
-            &device,
+            device,
             &stream_config,
             Arc::clone(&samples),
             Arc::clone(&samples_written),
+            Arc::clone(&stop_requested),
             target_samples,
             &stream_errors,
         ),
         cpal::SampleFormat::I16 => build_recording_stream::<i16>(
-            &device,
+            device,
             &stream_config,
             Arc::clone(&samples),
             Arc::clone(&samples_written),
+            Arc::clone(&stop_requested),
             target_samples,
             &stream_errors,
         ),
         cpal::SampleFormat::U16 => build_recording_stream::<u16>(
-            &device,
+            device,
             &stream_config,
             Arc::clone(&samples),
             Arc::clone(&samples_written),
+            Arc::clone(&stop_requested),
             target_samples,
             &stream_errors,
         ),
@@ -335,29 +406,18 @@ pub fn record_input(duration_seconds: f32) -> Result<RecordedAudio, RecordingErr
     stream
         .play()
         .map_err(|error| RecordingError::PlayStream(error.to_string()))?;
-    while samples_written.load(Ordering::Relaxed) < target_samples {
-        thread::sleep(Duration::from_millis(10));
-    }
-    drop(stream);
 
-    let samples = Arc::try_unwrap(samples)
-        .map_err(|_| RecordingError::BufferUnavailable)?
-        .into_inner()
-        .map_err(|_| RecordingError::BufferUnavailable)?;
-    let buffer = AudioBuffer {
-        sample_rate,
-        channels,
-        samples,
-    };
-    let report = RecordingReport {
+    Ok(RecordingTransport {
+        stream: Some(stream),
         device_name,
         sample_rate,
         channels,
-        frames_recorded: buffer.frames(),
-        stream_errors: stream_errors.load(Ordering::Relaxed),
-    };
-
-    Ok(RecordedAudio { buffer, report })
+        samples,
+        samples_written,
+        stream_errors,
+        stop_requested,
+        target_samples,
+    })
 }
 
 /// Read a 16-bit PCM WAV file into an audio buffer.
@@ -543,6 +603,62 @@ impl Drop for PlaybackTransport {
     }
 }
 
+impl RecordingTransport {
+    /// Stop recording and return the captured audio.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the internal capture buffer cannot be finalized.
+    pub fn stop(&mut self) -> Result<RecordedAudio, RecordingError> {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        drop(self.stream.take());
+        let samples = self
+            .samples
+            .lock()
+            .map_err(|_| RecordingError::BufferUnavailable)?
+            .clone();
+        let buffer = AudioBuffer {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            samples,
+        };
+        let report = RecordingReport {
+            device_name: self.device_name.clone(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            frames_recorded: buffer.frames(),
+            stream_errors: self.stream_errors.load(Ordering::Relaxed),
+        };
+        Ok(RecordedAudio { buffer, report })
+    }
+
+    /// Return the latest recording counters without stopping the stream.
+    #[must_use]
+    pub fn report(&self) -> RecordingReport {
+        RecordingReport {
+            device_name: self.device_name.clone(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            frames_recorded: self.samples_written.load(Ordering::Relaxed)
+                / usize::from(self.channels),
+            stream_errors: self.stream_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Return true once a fixed-duration recording has reached its limit.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.target_samples
+            .is_some_and(|target| self.samples_written.load(Ordering::Relaxed) >= target)
+    }
+}
+
+impl Drop for RecordingTransport {
+    fn drop(&mut self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+    }
+}
+
 impl fmt::Display for RenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -719,7 +835,8 @@ fn build_recording_stream<T>(
     config: &cpal::StreamConfig,
     samples: Arc<Mutex<Vec<f32>>>,
     samples_written: Arc<AtomicUsize>,
-    target_samples: usize,
+    stop_requested: Arc<AtomicBool>,
+    target_samples: Option<usize>,
     stream_errors: &Arc<AtomicU32>,
 ) -> Result<cpal::Stream, RecordingError>
 where
@@ -731,7 +848,13 @@ where
         .build_input_stream(
             config,
             move |input: &[T], _| {
-                write_recording_data(input, &samples, &samples_written, target_samples);
+                write_recording_data(
+                    input,
+                    &samples,
+                    &samples_written,
+                    &stop_requested,
+                    target_samples,
+                );
             },
             move |_| {
                 error_counter.fetch_add(1, Ordering::Relaxed);
@@ -745,19 +868,22 @@ fn write_recording_data<T>(
     input: &[T],
     samples: &Mutex<Vec<f32>>,
     samples_written: &AtomicUsize,
-    target_samples: usize,
+    stop_requested: &AtomicBool,
+    target_samples: Option<usize>,
 ) where
     T: Sample,
     f32: FromSample<T>,
 {
-    if samples_written.load(Ordering::Relaxed) >= target_samples {
+    if stop_requested.load(Ordering::Relaxed)
+        || target_samples.is_some_and(|target| samples_written.load(Ordering::Relaxed) >= target)
+    {
         return;
     }
     let Ok(mut samples) = samples.lock() else {
         return;
     };
     for sample in input {
-        if samples.len() >= target_samples {
+        if target_samples.is_some_and(|target| samples.len() >= target) {
             break;
         }
         samples.push(f32::from_sample(*sample));

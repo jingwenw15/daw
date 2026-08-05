@@ -168,3 +168,14 @@ timeline clip.
 cargo run --bin daw -- record-snippet /tmp/my-session <track-id> 2.0 0
 cargo run --bin daw-ui
 ```
+
+## Stage 15
+
+Recording has a non-blocking transport. The UI can start recording, keep the app
+responsive while the input stream runs, and stop recording to finalize/import the
+captured WAV as a timeline clip. The fixed-duration CLI command remains
+available for smoke tests and scripting.
+
+```sh
+cargo run --bin daw-ui
+```
