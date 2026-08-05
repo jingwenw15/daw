@@ -15,6 +15,7 @@ struct DawApp {
     project_path: String,
     new_project_name: String,
     new_track_name: String,
+    playhead_sample: String,
     media_source_path: String,
     clip_track_id: String,
     clip_media_id: String,
@@ -50,6 +51,7 @@ impl Default for DawApp {
             project_path: "/private/tmp/daw-ui-project".to_owned(),
             new_project_name: "UI Project".to_owned(),
             new_track_name: "Audio".to_owned(),
+            playhead_sample: "0".to_owned(),
             media_source_path: "/private/tmp/test-tone.wav".to_owned(),
             clip_track_id: String::new(),
             clip_media_id: String::new(),
@@ -99,6 +101,8 @@ impl DawApp {
                 if ui.button("Validate").clicked() {
                     self.validate_project();
                 }
+                ui.label("Playhead");
+                ui.text_edit_singleline(&mut self.playhead_sample);
                 if ui.button("Play").clicked() {
                     self.play_project();
                 }
@@ -208,6 +212,10 @@ impl DawApp {
         ui.horizontal(|ui| {
             if ui.button("Use First Track").clicked() {
                 self.use_first_recording_track();
+            }
+            if ui.button("Use Playhead").clicked() {
+                self.recording_start_sample
+                    .clone_from(&self.playhead_sample);
             }
             if ui.button("Start Record").clicked() {
                 self.start_recording();
@@ -582,7 +590,14 @@ impl DawApp {
         }
 
         let path = PathBuf::from(&self.project_path);
-        match render_project_buffer(&path, 1.0).and_then(|buffer| {
+        let start_sample = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        match render_project_buffer(&path, 1.0, start_sample).and_then(|buffer| {
             daw_engine::start_buffer_playback(buffer)
                 .map_err(|error| format!("Playback failed: {error}"))
         }) {
@@ -679,6 +694,7 @@ fn first_project_clip(project: &daw_model::Project) -> Option<&daw_model::Clip> 
 fn render_project_buffer(
     project_path: &Path,
     minimum_duration: f32,
+    start_sample: u64,
 ) -> Result<daw_engine::AudioBuffer, String> {
     let project = daw_model::load_project(project_path)
         .map_err(|error| format!("Project is invalid: {error}"))?;
@@ -687,9 +703,12 @@ fn render_project_buffer(
     let mut total_frames = duration_to_frames(minimum_duration, daw_engine::DEFAULT_SAMPLE_RATE)?;
     for track in &project.tracks {
         for clip in &track.clips {
-            let clip_end = usize::try_from(clip.start_sample.saturating_add(clip.duration_samples))
-                .map_err(|_| "Clip timeline position is too large".to_owned())?;
-            total_frames = total_frames.max(clip_end);
+            let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+            if clip_end > start_sample {
+                let relative_end = usize::try_from(clip_end - start_sample)
+                    .map_err(|_| "Clip timeline position is too large".to_owned())?;
+                total_frames = total_frames.max(relative_end);
+            }
         }
     }
 
@@ -705,6 +724,10 @@ fn render_project_buffer(
             continue;
         }
         for clip in &track.clips {
+            let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+            if clip_end <= start_sample {
+                continue;
+            }
             mix_clip_from_project(
                 project_path,
                 &project,
@@ -712,6 +735,7 @@ fn render_project_buffer(
                 &mut output,
                 track,
                 clip,
+                start_sample,
             )?;
         }
     }
@@ -726,6 +750,7 @@ fn mix_clip_from_project(
     output: &mut daw_engine::AudioBuffer,
     track: &daw_model::Track,
     clip: &daw_model::Clip,
+    render_start_sample: u64,
 ) -> Result<(), String> {
     let media = project
         .media
@@ -756,29 +781,39 @@ fn mix_clip_from_project(
         ));
     }
     let decoded = daw_engine::convert_channels(&decoded, output.channels);
-    let limited = limit_buffer_frames(
-        &decoded,
-        usize::try_from(clip.duration_samples)
-            .map_err(|_| "Clip duration is too large".to_owned())?,
-    );
+    let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+    let source_start = if render_start_sample > clip.start_sample {
+        usize::try_from(render_start_sample - clip.start_sample)
+            .map_err(|_| "Clip source start is too large".to_owned())?
+    } else {
+        0
+    };
+    let destination_start = if clip.start_sample >= render_start_sample {
+        usize::try_from(clip.start_sample - render_start_sample)
+            .map_err(|_| "Clip start is too large".to_owned())?
+    } else {
+        0
+    };
+    let remaining_clip_frames =
+        usize::try_from(clip_end - render_start_sample.max(clip.start_sample))
+            .map_err(|_| "Clip duration is too large".to_owned())?;
+    let limited = slice_buffer_frames(&decoded, source_start, remaining_clip_frames);
     daw_engine::mix_clip(
         output,
         &limited,
-        usize::try_from(clip.start_sample).map_err(|_| "Clip start is too large".to_owned())?,
+        destination_start,
         track.volume_percent,
         track.muted,
     );
     Ok(())
 }
 
-fn limit_buffer_frames(buffer: &daw_engine::AudioBuffer, frames: usize) -> daw_engine::AudioBuffer {
-    let channels = usize::from(buffer.channels);
-    let sample_count = buffer.samples.len().min(frames.saturating_mul(channels));
-    daw_engine::AudioBuffer {
-        sample_rate: buffer.sample_rate,
-        channels: buffer.channels,
-        samples: buffer.samples[..sample_count].to_vec(),
-    }
+fn slice_buffer_frames(
+    buffer: &daw_engine::AudioBuffer,
+    start_frame: usize,
+    frames: usize,
+) -> daw_engine::AudioBuffer {
+    daw_engine::slice_frames(buffer, start_frame, frames)
 }
 
 fn parse_u64(value: &str, label: &str) -> Result<u64, String> {

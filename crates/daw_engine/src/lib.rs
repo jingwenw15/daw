@@ -485,6 +485,23 @@ pub fn convert_channels(buffer: &AudioBuffer, channels: u16) -> AudioBuffer {
     }
 }
 
+/// Return a frame-range slice of an audio buffer.
+#[must_use]
+pub fn slice_frames(buffer: &AudioBuffer, start_frame: usize, frame_count: usize) -> AudioBuffer {
+    let channels = usize::from(buffer.channels);
+    let start_sample = start_frame
+        .saturating_mul(channels)
+        .min(buffer.samples.len());
+    let end_sample = start_sample
+        .saturating_add(frame_count.saturating_mul(channels))
+        .min(buffer.samples.len());
+    AudioBuffer {
+        sample_rate: buffer.sample_rate,
+        channels: buffer.channels,
+        samples: buffer.samples[start_sample..end_sample].to_vec(),
+    }
+}
+
 /// Render silence for a minimal project render placeholder.
 ///
 /// # Errors
@@ -1001,8 +1018,8 @@ fn parse_pcm16_wav(bytes: &[u8]) -> Result<AudioBuffer, RenderError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        convert_channels, mix_clip, read_wav, render_silence, render_sine, write_wav, AudioBuffer,
-        DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE,
+        convert_channels, mix_clip, read_wav, render_silence, render_sine, slice_frames, write_wav,
+        AudioBuffer, DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE,
     };
     use std::{fs, path::PathBuf};
 
@@ -1081,6 +1098,20 @@ mod tests {
 
         assert_eq!(stereo.channels, 2);
         assert_eq!(stereo.samples, vec![0.25, 0.25, -0.25, -0.25]);
+    }
+
+    #[test]
+    fn slices_frame_ranges() {
+        let buffer = AudioBuffer {
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            channels: 2,
+            samples: vec![0.0, 0.1, 1.0, 1.1, 2.0, 2.1],
+        };
+
+        let sliced = slice_frames(&buffer, 1, 2);
+
+        assert_eq!(sliced.channels, 2);
+        assert_eq!(sliced.samples, vec![1.0, 1.1, 2.0, 2.1]);
     }
 
     fn temp_file(name: &str) -> PathBuf {

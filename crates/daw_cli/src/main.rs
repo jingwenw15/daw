@@ -153,8 +153,9 @@ fn run_play_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), Stri
 fn run_play_project(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let project_path = required_arg(&mut args, "path")?;
     let duration = optional_f32(args.next(), 1.0, "minimum-duration-seconds")?;
+    let start_sample = optional_u64(args.next(), 0, "start-sample")?;
     no_extra_args(args)?;
-    let buffer = render_project_buffer(&project_path, duration)?;
+    let buffer = render_project_buffer(&project_path, duration, start_sample)?;
     let hold_seconds = frames_to_seconds(buffer.frames(), buffer.sample_rate) + 0.10;
     let report = daw_engine::play_buffer(buffer, hold_seconds)
         .map_err(|error| format!("failed to play project: {error}"))?;
@@ -193,8 +194,9 @@ fn run_render_project(mut args: impl Iterator<Item = String>) -> Result<(), Stri
     let project_path = required_arg(&mut args, "path")?;
     let output = required_arg(&mut args, "output")?;
     let duration = optional_f32(args.next(), 1.0, "duration-seconds")?;
+    let start_sample = optional_u64(args.next(), 0, "start-sample")?;
     no_extra_args(args)?;
-    let buffer = render_project_buffer(&project_path, duration)?;
+    let buffer = render_project_buffer(&project_path, duration, start_sample)?;
     daw_engine::write_wav(output.as_ref(), &buffer)
         .map_err(|error| format!("failed to write project render: {error}"))?;
     println!(
@@ -591,6 +593,7 @@ fn print_named_list(label: &str, values: &[String]) {
 fn render_project_buffer(
     project_path: &str,
     minimum_duration: f32,
+    start_sample: u64,
 ) -> Result<daw_engine::AudioBuffer, String> {
     let project = daw_model::load_project(project_path.as_ref())
         .map_err(|error| format!("project is invalid: {error}"))?;
@@ -599,9 +602,12 @@ fn render_project_buffer(
     let mut total_frames = duration_to_frames(minimum_duration, daw_engine::DEFAULT_SAMPLE_RATE)?;
     for track in &project.tracks {
         for clip in &track.clips {
-            let clip_end = usize::try_from(clip.start_sample.saturating_add(clip.duration_samples))
-                .map_err(|_| "clip timeline position is too large".to_owned())?;
-            total_frames = total_frames.max(clip_end);
+            let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+            if clip_end > start_sample {
+                let relative_end = usize::try_from(clip_end - start_sample)
+                    .map_err(|_| "clip timeline position is too large".to_owned())?;
+                total_frames = total_frames.max(relative_end);
+            }
         }
     }
 
@@ -617,6 +623,10 @@ fn render_project_buffer(
             continue;
         }
         for clip in &track.clips {
+            let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+            if clip_end <= start_sample {
+                continue;
+            }
             let media = project
                 .media
                 .iter()
@@ -649,16 +659,26 @@ fn render_project_buffer(
                 ));
             }
             let decoded = daw_engine::convert_channels(&decoded, output.channels);
-            let limited = limit_buffer_frames(
-                &decoded,
-                usize::try_from(clip.duration_samples)
-                    .map_err(|_| "clip duration is too large".to_owned())?,
-            );
+            let source_start = if start_sample > clip.start_sample {
+                usize::try_from(start_sample - clip.start_sample)
+                    .map_err(|_| "clip source start is too large".to_owned())?
+            } else {
+                0
+            };
+            let destination_start = if clip.start_sample >= start_sample {
+                usize::try_from(clip.start_sample - start_sample)
+                    .map_err(|_| "clip start is too large".to_owned())?
+            } else {
+                0
+            };
+            let remaining_clip_frames =
+                usize::try_from(clip_end - start_sample.max(clip.start_sample))
+                    .map_err(|_| "clip duration is too large".to_owned())?;
+            let limited = slice_buffer_frames(&decoded, source_start, remaining_clip_frames);
             daw_engine::mix_clip(
                 &mut output,
                 &limited,
-                usize::try_from(clip.start_sample)
-                    .map_err(|_| "clip start is too large".to_owned())?,
+                destination_start,
                 track.volume_percent,
                 track.muted,
             );
@@ -668,14 +688,12 @@ fn render_project_buffer(
     Ok(output)
 }
 
-fn limit_buffer_frames(buffer: &daw_engine::AudioBuffer, frames: usize) -> daw_engine::AudioBuffer {
-    let channels = usize::from(buffer.channels);
-    let sample_count = buffer.samples.len().min(frames.saturating_mul(channels));
-    daw_engine::AudioBuffer {
-        sample_rate: buffer.sample_rate,
-        channels: buffer.channels,
-        samples: buffer.samples[..sample_count].to_vec(),
-    }
+fn slice_buffer_frames(
+    buffer: &daw_engine::AudioBuffer,
+    start_frame: usize,
+    frames: usize,
+) -> daw_engine::AudioBuffer {
+    daw_engine::slice_frames(buffer, start_frame, frames)
 }
 
 fn print_help() {
@@ -708,9 +726,9 @@ fn print_help() {
     println!("  daw media verify <path>");
     println!("  daw media relink <path> <hash> <replacement>");
     println!("  daw render-test-tone <output> [duration-seconds]");
-    println!("  daw render-project <path> <output> [duration-seconds]");
+    println!("  daw render-project <path> <output> [duration-seconds] [start-sample]");
     println!("  daw play-test-tone [duration-seconds]");
-    println!("  daw play-project <path> [minimum-duration-seconds]");
+    println!("  daw play-project <path> [minimum-duration-seconds] [start-sample]");
     println!("  daw record-snippet <path> <track-id> [duration-seconds] [start-sample]");
     println!("  daw diff <path> <left-ref> <right-ref>");
     println!("  daw merge <path> <source-branch>");

@@ -179,3 +179,16 @@ available for smoke tests and scripting.
 ```sh
 cargo run --bin daw-ui
 ```
+
+## Stage 16
+
+Project rendering and playback can start from a timeline sample. Clips that
+begin before the start point are trimmed, clips after the start point are shifted
+earlier in the rendered buffer, and the UI exposes a playhead sample field that
+can also be copied into the recording insert position.
+
+```sh
+cargo run --bin daw -- render-project /tmp/my-session /tmp/from-playhead.wav 1.0 24000
+cargo run --bin daw -- play-project /tmp/my-session 1.0 24000
+cargo run --bin daw-ui
+```
