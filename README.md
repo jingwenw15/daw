@@ -229,3 +229,16 @@ project history and version-control-friendly state.
 ```sh
 cargo run --bin daw-ui
 ```
+
+## Stage 20
+
+The arrangement now owns the main editing workflow. Clicking the ruler or a
+track lane moves the playhead cursor, and pressing Enter starts playback from
+that cursor. Track headers expose volume sliders plus mute/solo buttons, so
+common audio controls are next to the track instead of buried in the utility
+area. The persistent sidebar has been replaced with a compact bottom utility
+strip for status and advanced project tools.
+
+```sh
+cargo run --bin daw-ui
+```

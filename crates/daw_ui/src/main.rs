@@ -3,7 +3,7 @@
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
-const TRACK_HEADER_WIDTH: f32 = 180.0;
+const TRACK_HEADER_WIDTH: f32 = 260.0;
 const TRACK_LANE_HEIGHT: f32 = 92.0;
 const MIN_TIMELINE_SAMPLES: u64 = 240_000;
 
@@ -71,6 +71,18 @@ struct ClipMoveRequest {
     duration_samples: u64,
 }
 
+#[derive(Clone, Debug)]
+enum ArrangementAction {
+    MoveClip(ClipMoveRequest),
+    SetPlayhead(u64),
+    SetTrackControls {
+        track_id: daw_model::StableId,
+        volume_percent: u16,
+        muted: bool,
+        solo: bool,
+    },
+}
+
 impl Default for DawApp {
     fn default() -> Self {
         Self {
@@ -107,11 +119,12 @@ impl Default for DawApp {
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll_playback();
+        self.handle_shortcuts(ctx);
         if self.recording.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
         self.render_transport(ctx);
-        self.render_inspector(ctx);
+        self.render_utilities(ctx);
         self.render_project(ctx);
     }
 }
@@ -179,35 +192,33 @@ impl DawApp {
         });
     }
 
-    fn render_inspector(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("inspector")
+    fn render_utilities(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("utilities")
             .resizable(true)
-            .default_width(300.0)
+            .default_height(72.0)
             .show(ctx, |ui| {
-                ui.heading("Project");
-                ui.collapsing("Project setup", |ui| {
-                    self.render_project_edit_section(ui);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&self.status);
+                    ui.separator();
                     if ui.button("Validate").clicked() {
                         self.validate_project();
                     }
+                    if ui.button("Generate Waveforms").clicked() {
+                        self.generate_waveforms();
+                    }
                 });
-                ui.collapsing("Import and manual clip", |ui| {
-                    self.render_media_clip_section(ui);
+                ui.collapsing("Advanced project tools", |ui| {
+                    ui.columns(4, |columns| {
+                        columns[0].heading("Project");
+                        self.render_project_edit_section(&mut columns[0]);
+                        columns[1].heading("Media");
+                        self.render_media_clip_section(&mut columns[1]);
+                        columns[2].heading("Clip");
+                        self.render_clip_edit_section(&mut columns[2]);
+                        columns[3].heading("Snapshots");
+                        self.render_snapshot_section(&mut columns[3]);
+                    });
                 });
-                ui.collapsing("Clip edit", |ui| {
-                    self.render_clip_edit_section(ui);
-                });
-                ui.collapsing("Snapshots", |ui| {
-                    self.render_snapshot_section(ui);
-                });
-                ui.collapsing("Recording details", |ui| {
-                    self.render_recording_section(ui);
-                });
-                ui.collapsing("Mixer", |ui| {
-                    self.render_mixer_section(ui);
-                });
-                ui.separator();
-                ui.label(&self.status);
             });
     }
 
@@ -286,50 +297,6 @@ impl DawApp {
         ui.separator();
     }
 
-    fn render_recording_section(&mut self, ui: &mut egui::Ui) {
-        ui.label("Recording track id");
-        ui.text_edit_singleline(&mut self.recording_track_id);
-        ui.horizontal(|ui| {
-            ui.label("Start");
-            ui.text_edit_singleline(&mut self.recording_start_sample);
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Use First Track").clicked() {
-                self.use_first_recording_track();
-            }
-            if ui.button("Use Playhead").clicked() {
-                self.recording_start_sample
-                    .clone_from(&self.playhead_sample);
-            }
-            if ui.button("Start Record").clicked() {
-                self.start_recording();
-            }
-            if ui.button("Stop Record").clicked() {
-                self.stop_recording();
-            }
-        });
-        ui.separator();
-    }
-
-    fn render_mixer_section(&mut self, ui: &mut egui::Ui) {
-        ui.label("Mixer track id");
-        ui.text_edit_singleline(&mut self.mixer_track_id);
-        ui.label("Volume percent");
-        ui.text_edit_singleline(&mut self.mixer_volume_percent);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.mixer_muted, "Muted");
-            ui.checkbox(&mut self.mixer_solo, "Solo");
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Use First Track").clicked() {
-                self.use_first_mixer_track();
-            }
-            if ui.button("Set Controls").clicked() {
-                self.set_track_controls();
-            }
-        });
-    }
-
     fn render_project(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(project) = self.project.clone() {
@@ -343,7 +310,7 @@ impl DawApp {
                 });
                 ui.separator();
                 let live_recording = self.live_recording_preview();
-                let move_request = render_arrangement(
+                let actions = render_arrangement(
                     ui,
                     &project,
                     &self.media,
@@ -351,8 +318,8 @@ impl DawApp {
                     &self.playhead_sample,
                     live_recording.as_ref(),
                 );
-                if let Some(move_request) = move_request {
-                    self.commit_clip_move(&move_request);
+                for action in actions {
+                    self.apply_arrangement_action(&action);
                 }
             } else {
                 ui.heading("No project loaded");
@@ -468,21 +435,6 @@ impl DawApp {
             "Selected first track/media IDs".clone_into(&mut self.status);
         } else {
             "Open a project before selecting IDs".clone_into(&mut self.status);
-        }
-    }
-
-    fn use_first_mixer_track(&mut self) {
-        let track = self
-            .project
-            .as_ref()
-            .and_then(|project| project.tracks.first().cloned());
-        if let Some(track) = track {
-            self.set_mixer_fields_from_track(&track);
-            "Selected first track controls".clone_into(&mut self.status);
-        } else if self.project.is_some() {
-            "Project has no tracks".clone_into(&mut self.status);
-        } else {
-            "Open a project before selecting track controls".clone_into(&mut self.status);
         }
     }
 
@@ -644,6 +596,51 @@ impl DawApp {
         }
     }
 
+    fn apply_arrangement_action(&mut self, action: &ArrangementAction) {
+        match action {
+            ArrangementAction::MoveClip(request) => self.commit_clip_move(request),
+            ArrangementAction::SetPlayhead(sample) => {
+                self.playhead_sample = sample.to_string();
+                self.recording_start_sample = self.playhead_sample.clone();
+                self.status = format!("Playhead set to {sample}");
+            }
+            ArrangementAction::SetTrackControls {
+                track_id,
+                volume_percent,
+                muted,
+                solo,
+            } => self.commit_track_controls(track_id, *volume_percent, *muted, *solo),
+        }
+    }
+
+    fn commit_track_controls(
+        &mut self,
+        track_id: &daw_model::StableId,
+        volume_percent: u16,
+        muted: bool,
+        solo: bool,
+    ) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::set_track_controls(&path, track_id, volume_percent, muted, solo) {
+            Ok(track) => {
+                self.status = format!(
+                    "Set '{}' controls: volume={} muted={} solo={}",
+                    track.name, track.volume_percent, track.muted, track.solo
+                );
+                self.set_mixer_fields_from_track(&track);
+                self.reload_project();
+            }
+            Err(error) => self.status = format!("Set controls failed: {error}"),
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let enter_pressed = ctx.input(|input| input.key_pressed(egui::Key::Enter));
+        if enter_pressed && self.project.is_some() {
+            self.play_project();
+        }
+    }
+
     fn use_first_clip(&mut self) {
         let clip = self.project.as_ref().and_then(first_project_clip).cloned();
         if let Some(clip) = clip {
@@ -711,34 +708,6 @@ impl DawApp {
         }
     }
 
-    fn set_track_controls(&mut self) {
-        let path = PathBuf::from(&self.project_path);
-        let volume_percent = match parse_u16(&self.mixer_volume_percent, "track volume") {
-            Ok(value) => value,
-            Err(error) => {
-                self.status = error;
-                return;
-            }
-        };
-
-        match daw_model::set_track_controls(
-            &path,
-            &daw_model::StableId::from_string(self.mixer_track_id.clone()),
-            volume_percent,
-            self.mixer_muted,
-            self.mixer_solo,
-        ) {
-            Ok(track) => {
-                self.status = format!(
-                    "Set '{}' controls: volume={} muted={} solo={}",
-                    track.name, track.volume_percent, track.muted, track.solo
-                );
-                self.reload_project();
-            }
-            Err(error) => self.status = format!("Set controls failed: {error}"),
-        }
-    }
-
     fn play_project(&mut self) {
         if self.transport.is_some() {
             self.stop_playback();
@@ -794,32 +763,33 @@ fn render_arrangement(
     waveforms: &[daw_media::WaveformSummary],
     playhead_sample: &str,
     live_recording: Option<&LiveRecordingPreview>,
-) -> Option<ClipMoveRequest> {
+) -> Vec<ArrangementAction> {
     let timeline_samples = timeline_sample_span(project, live_recording);
     let playhead = playhead_sample.parse::<u64>().unwrap_or(0);
-    let mut move_request = None;
+    let mut actions = Vec::new();
 
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let available_width = ui.available_width().max(860.0);
             let timeline_width = (available_width - TRACK_HEADER_WIDTH).max(640.0);
-            render_time_ruler(ui, timeline_width, timeline_samples, playhead);
+            if let Some(sample) = render_time_ruler(ui, timeline_width, timeline_samples, playhead)
+            {
+                actions.push(ArrangementAction::SetPlayhead(sample));
+            }
 
             for track in &project.tracks {
-                if move_request.is_none() {
-                    move_request = render_track_lane(
-                        ui,
-                        project,
-                        track,
-                        media_objects,
-                        waveforms,
-                        timeline_samples,
-                        timeline_width,
-                        playhead,
-                        live_recording,
-                    );
-                }
+                actions.extend(render_track_lane(
+                    ui,
+                    project,
+                    track,
+                    media_objects,
+                    waveforms,
+                    timeline_samples,
+                    timeline_width,
+                    playhead,
+                    live_recording,
+                ));
             }
 
             if project.tracks.is_empty() {
@@ -829,7 +799,7 @@ fn render_arrangement(
                 });
             }
         });
-    move_request
+    actions
 }
 
 #[allow(
@@ -837,9 +807,14 @@ fn render_arrangement(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn render_time_ruler(ui: &mut egui::Ui, timeline_width: f32, timeline_samples: u64, playhead: u64) {
+fn render_time_ruler(
+    ui: &mut egui::Ui,
+    timeline_width: f32,
+    timeline_samples: u64,
+    playhead: u64,
+) -> Option<u64> {
     let desired = egui::vec2(TRACK_HEADER_WIDTH + timeline_width, 34.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
     let painter = ui.painter_at(rect);
     let timeline_rect = egui::Rect::from_min_max(
         egui::pos2(rect.left() + TRACK_HEADER_WIDTH, rect.top()),
@@ -874,6 +849,10 @@ fn render_time_ruler(ui: &mut egui::Ui, timeline_width: f32, timeline_samples: u
         );
     }
     draw_playhead(&painter, timeline_rect, playhead, timeline_samples);
+    response
+        .interact_pointer_pos()
+        .filter(|_| response.clicked())
+        .map(|position| sample_from_x(position.x, timeline_rect, timeline_samples))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -887,7 +866,8 @@ fn render_track_lane(
     timeline_width: f32,
     playhead: u64,
     live_recording: Option<&LiveRecordingPreview>,
-) -> Option<ClipMoveRequest> {
+) -> Vec<ArrangementAction> {
+    let mut actions = Vec::new();
     let desired = egui::vec2(TRACK_HEADER_WIDTH + timeline_width, TRACK_LANE_HEIGHT);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -906,41 +886,39 @@ fn render_track_lane(
         [rect.left_bottom(), rect.right_bottom()],
         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(52, 56, 64)),
     );
-    painter.text(
-        header_rect.left_top() + egui::vec2(12.0, 14.0),
-        egui::Align2::LEFT_TOP,
-        &track.name,
-        egui::FontId::proportional(16.0),
-        egui::Color32::from_rgb(235, 236, 240),
-    );
-    painter.text(
-        header_rect.left_top() + egui::vec2(12.0, 42.0),
-        egui::Align2::LEFT_TOP,
-        format!(
-            "vol {}  {}{}",
-            track.volume_percent,
-            if track.muted { "M" } else { "-" },
-            if track.solo { " S" } else { " -" }
-        ),
-        egui::FontId::monospace(12.0),
-        egui::Color32::from_rgb(166, 172, 184),
-    );
+    if let Some(action) = render_track_header_controls(ui, header_rect, track) {
+        actions.push(action);
+    }
 
     draw_lane_grid(&painter, lane_rect);
     draw_playhead(&painter, lane_rect, playhead, timeline_samples);
+    let lane_response = ui.interact(
+        lane_rect,
+        egui::Id::new(("lane", track.id.to_string())),
+        egui::Sense::click(),
+    );
+    if let Some(position) = lane_response
+        .interact_pointer_pos()
+        .filter(|_| lane_response.clicked())
+    {
+        actions.push(ArrangementAction::SetPlayhead(sample_from_x(
+            position.x,
+            lane_rect,
+            timeline_samples,
+        )));
+    }
 
-    let mut move_request = None;
     for clip in &track.clips {
-        if move_request.is_none() {
-            move_request = render_clip(
-                ui,
-                project,
-                media_objects,
-                waveforms,
-                lane_rect,
-                clip,
-                timeline_samples,
-            );
+        if let Some(move_request) = render_clip(
+            ui,
+            project,
+            media_objects,
+            waveforms,
+            lane_rect,
+            clip,
+            timeline_samples,
+        ) {
+            actions.push(ArrangementAction::MoveClip(move_request));
         }
     }
 
@@ -948,7 +926,84 @@ fn render_track_lane(
         render_live_recording(&painter, lane_rect, live_recording, timeline_samples);
     }
 
-    move_request
+    actions
+}
+
+fn render_track_header_controls(
+    ui: &mut egui::Ui,
+    header_rect: egui::Rect,
+    track: &daw_model::Track,
+) -> Option<ArrangementAction> {
+    let painter = ui.painter_at(header_rect);
+    painter.text(
+        header_rect.left_top() + egui::vec2(12.0, 10.0),
+        egui::Align2::LEFT_TOP,
+        &track.name,
+        egui::FontId::proportional(16.0),
+        egui::Color32::from_rgb(235, 236, 240),
+    );
+    painter.text(
+        header_rect.left_top() + egui::vec2(12.0, 34.0),
+        egui::Align2::LEFT_TOP,
+        format!("{}%", track.volume_percent),
+        egui::FontId::monospace(12.0),
+        egui::Color32::from_rgb(166, 172, 184),
+    );
+
+    let mut volume = track.volume_percent;
+    let slider_rect = egui::Rect::from_min_size(
+        header_rect.left_top() + egui::vec2(70.0, 30.0),
+        egui::vec2(118.0, 20.0),
+    );
+    let volume_response = ui.put(
+        slider_rect,
+        egui::Slider::new(&mut volume, 0..=200).show_value(false),
+    );
+
+    let muted_response = ui.put(
+        egui::Rect::from_min_size(
+            header_rect.left_top() + egui::vec2(12.0, 58.0),
+            egui::vec2(36.0, 24.0),
+        ),
+        egui::Button::new("M").fill(if track.muted {
+            egui::Color32::from_rgb(190, 132, 40)
+        } else {
+            egui::Color32::from_rgb(57, 61, 69)
+        }),
+    );
+    let solo_response = ui.put(
+        egui::Rect::from_min_size(
+            header_rect.left_top() + egui::vec2(56.0, 58.0),
+            egui::vec2(36.0, 24.0),
+        ),
+        egui::Button::new("S").fill(if track.solo {
+            egui::Color32::from_rgb(55, 132, 92)
+        } else {
+            egui::Color32::from_rgb(57, 61, 69)
+        }),
+    );
+
+    let muted = if muted_response.clicked() {
+        !track.muted
+    } else {
+        track.muted
+    };
+    let solo = if solo_response.clicked() {
+        !track.solo
+    } else {
+        track.solo
+    };
+    let volume_changed = volume_response.changed();
+    if volume_changed || muted != track.muted || solo != track.solo {
+        Some(ArrangementAction::SetTrackControls {
+            track_id: track.id.clone(),
+            volume_percent: volume,
+            muted,
+            solo,
+        })
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1170,6 +1225,17 @@ fn pixels_to_samples(delta_pixels: f32, timeline_width: f32, timeline_samples: u
     ((delta_pixels / timeline_width) * timeline_samples as f32).round() as i64
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn sample_from_x(x: f32, timeline_rect: egui::Rect, timeline_samples: u64) -> u64 {
+    let fraction =
+        ((x - timeline_rect.left()) / timeline_rect.width().max(1.0_f32)).clamp(0.0, 1.0);
+    (fraction * timeline_samples as f32).round() as u64
+}
+
 fn apply_sample_delta(sample: u64, delta: i64) -> u64 {
     if delta >= 0 {
         sample.saturating_add(delta.unsigned_abs())
@@ -1337,12 +1403,6 @@ fn slice_buffer_frames(
 fn parse_u64(value: &str, label: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
-        .map_err(|error| format!("Invalid {label}: {error}"))
-}
-
-fn parse_u16(value: &str, label: &str) -> Result<u16, String> {
-    value
-        .parse::<u16>()
         .map_err(|error| format!("Invalid {label}: {error}"))
 }
 
