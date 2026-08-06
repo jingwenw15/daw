@@ -621,14 +621,12 @@ impl Drop for PlaybackTransport {
 }
 
 impl RecordingTransport {
-    /// Stop recording and return the captured audio.
+    /// Return the currently captured audio without stopping the input stream.
     ///
     /// # Errors
     ///
-    /// Returns an error if the internal capture buffer cannot be finalized.
-    pub fn stop(&mut self) -> Result<RecordedAudio, RecordingError> {
-        self.stop_requested.store(true, Ordering::Relaxed);
-        drop(self.stream.take());
+    /// Returns an error if the internal capture buffer cannot be read.
+    pub fn snapshot(&self) -> Result<RecordedAudio, RecordingError> {
         let samples = self
             .samples
             .lock()
@@ -647,6 +645,17 @@ impl RecordingTransport {
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
         };
         Ok(RecordedAudio { buffer, report })
+    }
+
+    /// Stop recording and return the captured audio.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the internal capture buffer cannot be finalized.
+    pub fn stop(&mut self) -> Result<RecordedAudio, RecordingError> {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        drop(self.stream.take());
+        self.snapshot()
     }
 
     /// Return the latest recording counters without stopping the stream.

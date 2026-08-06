@@ -206,3 +206,26 @@ cargo run --bin daw -- media waveform /tmp/my-session <hash> 512
 cargo run --bin daw -- media waveforms /tmp/my-session
 cargo run --bin daw-ui
 ```
+
+## Stage 18
+
+The native UI now opens on an arrangement-style workflow instead of a debug
+form. The top transport exposes project open/create, play/stop, a prominent
+record button, and quick track creation. Recording targets the first track by
+default, inserts the captured audio as a clip, generates its waveform cache, and
+the main timeline draws waveform clips in track lanes.
+
+```sh
+cargo run --bin daw-ui
+```
+
+## Stage 19
+
+Recording draws a live waveform preview in the target track lane while the input
+stream is running. Existing clips can be dragged horizontally in the arrangement;
+the move is committed through the command log when the drag ends, preserving
+project history and version-control-friendly state.
+
+```sh
+cargo run --bin daw-ui
+```
