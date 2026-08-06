@@ -192,3 +192,17 @@ cargo run --bin daw -- render-project /tmp/my-session /tmp/from-playhead.wav 1.0
 cargo run --bin daw -- play-project /tmp/my-session 1.0 24000
 cargo run --bin daw-ui
 ```
+
+## Stage 17
+
+Imported 16-bit PCM WAV media can generate deterministic waveform preview
+caches under `cache/waveforms`. The CLI can build one cache or all supported
+media caches, and the UI can generate caches and show cached peak counts next to
+media objects. These caches are derived data and can be regenerated from the
+content-addressed media store.
+
+```sh
+cargo run --bin daw -- media waveform /tmp/my-session <hash> 512
+cargo run --bin daw -- media waveforms /tmp/my-session
+cargo run --bin daw-ui
+```

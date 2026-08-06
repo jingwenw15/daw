@@ -271,6 +271,38 @@ fn run_media(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             println!("source: {}", object.original_path);
             Ok(())
         }
+        Some("waveform") => {
+            let project = required_arg(&mut args, "path")?;
+            let hash = required_arg(&mut args, "hash")?;
+            let points = optional_usize(args.next(), daw_media::DEFAULT_WAVEFORM_POINTS, "points")?;
+            no_extra_args(args)?;
+            let waveform = daw_media::generate_waveform(project.as_ref(), &hash, points)
+                .map_err(|error| format!("failed to generate waveform: {error}"))?;
+            println!(
+                "waveform {}: {} peaks, {} frames/peak",
+                waveform.hash,
+                waveform.peaks.len(),
+                waveform.frames_per_peak
+            );
+            Ok(())
+        }
+        Some("waveforms") => {
+            let project = required_arg(&mut args, "path")?;
+            let points = optional_usize(args.next(), daw_media::DEFAULT_WAVEFORM_POINTS, "points")?;
+            no_extra_args(args)?;
+            let waveforms = daw_media::generate_waveforms(project.as_ref(), points)
+                .map_err(|error| format!("failed to generate waveforms: {error}"))?;
+            println!("generated {} waveform caches", waveforms.len());
+            for waveform in waveforms {
+                println!(
+                    "{} {} peaks {} frames/peak",
+                    waveform.hash,
+                    waveform.peaks.len(),
+                    waveform.frames_per_peak
+                );
+            }
+            Ok(())
+        }
         Some(command) => Err(format!(
             "unknown media command: {command}\nrun `daw --help` for usage"
         )),
@@ -725,6 +757,8 @@ fn print_help() {
     println!("  daw media list <path>");
     println!("  daw media verify <path>");
     println!("  daw media relink <path> <hash> <replacement>");
+    println!("  daw media waveform <path> <hash> [points]");
+    println!("  daw media waveforms <path> [points]");
     println!("  daw render-test-tone <output> [duration-seconds]");
     println!("  daw render-project <path> <output> [duration-seconds] [start-sample]");
     println!("  daw play-test-tone [duration-seconds]");
@@ -754,6 +788,14 @@ fn optional_u64(value: Option<String>, default: u64, name: &str) -> Result<u64, 
     value.map_or(Ok(default), |value| {
         value
             .parse::<u64>()
+            .map_err(|error| format!("invalid {name}: {error}"))
+    })
+}
+
+fn optional_usize(value: Option<String>, default: usize, name: &str) -> Result<usize, String> {
+    value.map_or(Ok(default), |value| {
+        value
+            .parse::<usize>()
             .map_err(|error| format!("invalid {name}: {error}"))
     })
 }

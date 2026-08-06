@@ -34,6 +34,7 @@ struct DawApp {
     status: String,
     project: Option<daw_model::Project>,
     media: Vec<daw_media::MediaObject>,
+    waveforms: Vec<daw_media::WaveformSummary>,
     history: Vec<daw_model::HistoryItem>,
     transport: Option<daw_engine::PlaybackTransport>,
     recording: Option<ActiveRecording>,
@@ -70,6 +71,7 @@ impl Default for DawApp {
             status: "No project loaded".to_owned(),
             project: None,
             media: Vec::new(),
+            waveforms: Vec::new(),
             history: Vec::new(),
             transport: None,
             recording: None,
@@ -147,6 +149,9 @@ impl DawApp {
         ui.text_edit_singleline(&mut self.media_source_path);
         if ui.button("Import Media").clicked() {
             self.import_media();
+        }
+        if ui.button("Generate Waveforms").clicked() {
+            self.generate_waveforms();
         }
         ui.separator();
         ui.label("Clip track id");
@@ -257,7 +262,7 @@ impl DawApp {
                 ui.separator();
                 ui.columns(3, |columns| {
                     render_tracks_column(&mut columns[0], project);
-                    render_media_column(&mut columns[1], project, &self.media);
+                    render_media_column(&mut columns[1], project, &self.media, &self.waveforms);
                     render_history_column(&mut columns[2], &self.history);
                 });
             } else {
@@ -294,6 +299,11 @@ impl DawApp {
     fn reload_auxiliary(&mut self) {
         let path = PathBuf::from(&self.project_path);
         self.media = daw_media::list_media(&path).unwrap_or_default();
+        self.waveforms = self
+            .media
+            .iter()
+            .filter_map(|media| daw_media::load_waveform(&path, &media.hash).ok())
+            .collect();
         self.history = daw_model::history(&path).unwrap_or_default();
     }
 
@@ -340,6 +350,17 @@ impl DawApp {
                 self.reload_project();
             }
             Err(error) => self.status = format!("Media registration failed: {error}"),
+        }
+    }
+
+    fn generate_waveforms(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_media::generate_waveforms(&path, daw_media::DEFAULT_WAVEFORM_POINTS) {
+            Ok(waveforms) => {
+                self.status = format!("Generated {} waveform caches", waveforms.len());
+                self.reload_auxiliary();
+            }
+            Err(error) => self.status = format!("Waveform generation failed: {error}"),
         }
     }
 
@@ -657,6 +678,7 @@ fn render_media_column(
     ui: &mut egui::Ui,
     project: &daw_model::Project,
     media_objects: &[daw_media::MediaObject],
+    waveforms: &[daw_media::WaveformSummary],
 ) {
     ui.heading("Media");
     for media_ref in &project.media {
@@ -673,6 +695,16 @@ fn render_media_column(
             ui.label("store object");
             ui.monospace(&media.hash);
             ui.label(format!("{} bytes", media.byte_size));
+            if let Some(waveform) = waveforms
+                .iter()
+                .find(|waveform| waveform.hash == media.hash)
+            {
+                ui.label(format!(
+                    "waveform: {} peaks, {} frames/peak",
+                    waveform.peaks.len(),
+                    waveform.frames_per_peak
+                ));
+            }
         });
     }
 }
