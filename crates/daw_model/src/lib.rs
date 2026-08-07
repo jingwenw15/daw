@@ -107,6 +107,11 @@ pub enum ProjectCommand {
         /// Track to append.
         track: Track,
     },
+    /// Remove a timeline track and its clips.
+    RemoveTrack {
+        /// Track to remove.
+        track_id: StableId,
+    },
     /// Add or update a media reference.
     AddMediaReference {
         /// Media reference to store.
@@ -378,6 +383,7 @@ impl ProjectCommand {
     fn summary(&self) -> String {
         match self {
             Self::AddTrack { track } => format!("add track '{}'", track.name),
+            Self::RemoveTrack { track_id } => format!("remove track {track_id}"),
             Self::AddMediaReference { media } => {
                 format!(
                     "add media {}",
@@ -633,6 +639,29 @@ pub fn add_track(project_dir: &Path, name: &str) -> Result<Track, ProjectIoError
         },
     )?;
     Ok(track)
+}
+
+/// Remove a track and its clips through the command log.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the track is unknown, or
+/// the updated project cannot be saved.
+pub fn remove_track(project_dir: &Path, track_id: &StableId) -> Result<Track, ProjectIoError> {
+    let project = load_project(project_dir)?;
+    let removed = project
+        .tracks
+        .iter()
+        .find(|track| track.id == *track_id)
+        .cloned()
+        .ok_or_else(|| unknown_track_error(track_id))?;
+    append_and_apply(
+        project_dir,
+        ProjectCommand::RemoveTrack {
+            track_id: track_id.clone(),
+        },
+    )?;
+    Ok(removed)
 }
 
 /// Add or update a media reference through the command log.
@@ -987,6 +1016,7 @@ fn apply_command(
             project.tracks.push(track.clone());
             validate_project_state(project)
         }
+        ProjectCommand::RemoveTrack { track_id } => apply_remove_track(project, track_id),
         ProjectCommand::AddMediaReference { media } => {
             if let Some(existing) = project
                 .media
@@ -1059,10 +1089,36 @@ fn apply_remove_clip(mut project: Project, clip_id: &StableId) -> Result<Project
         removed |= track.clips.len() != clip_count;
     }
     if removed {
+        prune_unused_media_references(&mut project);
         validate_project_state(project)
     } else {
         Err(unknown_clip_error(clip_id))
     }
+}
+
+fn apply_remove_track(
+    mut project: Project,
+    track_id: &StableId,
+) -> Result<Project, ProjectIoError> {
+    let track_count = project.tracks.len();
+    project.tracks.retain(|track| track.id != *track_id);
+    if project.tracks.len() == track_count {
+        return Err(unknown_track_error(track_id));
+    }
+    prune_unused_media_references(&mut project);
+    validate_project_state(project)
+}
+
+fn prune_unused_media_references(project: &mut Project) {
+    let used_media_ids = project
+        .tracks
+        .iter()
+        .flat_map(|track| &track.clips)
+        .map(|clip| clip.media_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    project
+        .media
+        .retain(|media| used_media_ids.contains(&media.id));
 }
 
 fn apply_set_track_controls(
@@ -1280,8 +1336,9 @@ mod tests {
     use super::{
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
-        project_file_path, remove_clip, replay_project, set_clip_placement, set_track_controls,
-        switch_branch, Project, ProjectIoError, StableId, Track, PROJECT_SCHEMA_VERSION,
+        project_file_path, remove_clip, remove_track, replay_project, set_clip_placement,
+        set_track_controls, switch_branch, Project, ProjectIoError, StableId, Track,
+        PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1468,6 +1525,63 @@ mod tests {
         assert_eq!(edited.duration_samples, 36_000);
         assert_eq!(removed, first_clip);
         assert_eq!(project.tracks[0].clips, vec![edited]);
+        assert_eq!(project.media, vec![media]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn removes_unused_media_when_last_clip_is_removed() {
+        let project_dir = temp_project_dir("clip-media-prune");
+        init_project(&project_dir, "Clip Media Prune").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 0, 24_000).expect("add clip");
+
+        remove_clip(&project_dir, &clip.id).expect("remove clip");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert!(project.tracks[0].clips.is_empty());
+        assert!(project.media.is_empty());
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn removes_track_and_prunes_its_media() {
+        let project_dir = temp_project_dir("track-remove");
+        init_project(&project_dir, "Track Remove").expect("init project");
+        let first = add_track(&project_dir, "First").expect("add first track");
+        let second = add_track(&project_dir, "Second").expect("add second track");
+        let first_media =
+            add_media_reference(&project_dir, "abc123", Some("/tmp/first.wav".to_owned()))
+                .expect("add first media");
+        let second_media =
+            add_media_reference(&project_dir, "def456", Some("/tmp/second.wav".to_owned()))
+                .expect("add second media");
+        add_clip(&project_dir, &first.id, &first_media.id, 0, 24_000).expect("add first clip");
+        let second_clip = add_clip(&project_dir, &second.id, &second_media.id, 48_000, 12_000)
+            .expect("add second clip");
+
+        let removed = remove_track(&project_dir, &first.id).expect("remove track");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(removed.id, first.id);
+        assert_eq!(removed.name, first.name);
+        assert_eq!(removed.clips.len(), 1);
+        assert_eq!(
+            project.tracks,
+            vec![Track {
+                clips: vec![second_clip],
+                ..second
+            }]
+        );
+        assert_eq!(project.media, vec![second_media]);
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");

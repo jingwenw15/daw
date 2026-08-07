@@ -78,11 +78,18 @@ struct ClipMoveRequest {
     duration_samples: u64,
 }
 
+struct ClipRenderResult {
+    rect: egui::Rect,
+    action: Option<ArrangementAction>,
+}
+
 #[derive(Clone, Debug)]
 enum ArrangementAction {
     MoveClip(ClipMoveRequest),
     SetPlayhead(u64),
     SelectClip(daw_model::StableId),
+    ArmTrack(daw_model::StableId),
+    RemoveTrack(daw_model::StableId),
     SetTrackControls {
         track_id: daw_model::StableId,
         volume_percent: u16,
@@ -347,6 +354,7 @@ impl DawApp {
                     live_recording.as_ref(),
                     self.timeline_zoom,
                     self.selected_clip_id.as_ref(),
+                    &self.recording_track_id,
                 );
                 for action in actions {
                     self.apply_arrangement_action(&action);
@@ -649,6 +657,11 @@ impl DawApp {
                     self.set_clip_edit_fields(&clip);
                 }
             }
+            ArrangementAction::ArmTrack(track_id) => {
+                self.recording_track_id = track_id.to_string();
+                self.status = format!("Armed track {track_id}");
+            }
+            ArrangementAction::RemoveTrack(track_id) => self.remove_track(track_id),
             ArrangementAction::SetTrackControls {
                 track_id,
                 volume_percent,
@@ -787,6 +800,22 @@ impl DawApp {
         }
     }
 
+    fn remove_track(&mut self, track_id: &daw_model::StableId) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::remove_track(&path, track_id) {
+            Ok(track) => {
+                self.status = format!("Removed track '{}'", track.name);
+                if self.recording_track_id == track.id.to_string() {
+                    self.recording_track_id.clear();
+                }
+                self.selected_clip_id = None;
+                self.edit_clip_id.clear();
+                self.reload_project();
+            }
+            Err(error) => self.status = format!("Remove track failed: {error}"),
+        }
+    }
+
     fn play_project(&mut self) {
         if self.playback.is_some() {
             self.stop_playback();
@@ -856,6 +885,7 @@ fn render_arrangement(
     live_recording: Option<&LiveRecordingPreview>,
     timeline_zoom: f32,
     selected_clip_id: Option<&daw_model::StableId>,
+    recording_track_id: &str,
 ) -> Vec<ArrangementAction> {
     let timeline_samples = timeline_sample_span(project, live_recording);
     let playhead = playhead_sample.parse::<u64>().unwrap_or(0);
@@ -889,6 +919,7 @@ fn render_arrangement(
                     playhead,
                     live_recording,
                     selected_clip_id,
+                    recording_track_id,
                 ));
             }
 
@@ -914,7 +945,7 @@ fn render_time_ruler(
     playhead: u64,
 ) -> Option<u64> {
     let desired = egui::vec2(TRACK_HEADER_WIDTH + timeline_width, 34.0);
-    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let timeline_rect = egui::Rect::from_min_max(
         egui::pos2(rect.left() + TRACK_HEADER_WIDTH, rect.top()),
@@ -951,7 +982,9 @@ fn render_time_ruler(
     draw_playhead(&painter, timeline_rect, playhead, timeline_samples);
     response
         .interact_pointer_pos()
-        .filter(|_| response.clicked())
+        .filter(|_| {
+            response.clicked() || response.dragged() || response.is_pointer_button_down_on()
+        })
         .map(|position| sample_from_x(position.x, timeline_rect, timeline_samples))
 }
 
@@ -967,6 +1000,7 @@ fn render_track_lane(
     playhead: u64,
     live_recording: Option<&LiveRecordingPreview>,
     selected_clip_id: Option<&daw_model::StableId>,
+    recording_track_id: &str,
 ) -> Vec<ArrangementAction> {
     let mut actions = Vec::new();
     let desired = egui::vec2(TRACK_HEADER_WIDTH + timeline_width, TRACK_LANE_HEIGHT);
@@ -987,30 +1021,16 @@ fn render_track_lane(
         [rect.left_bottom(), rect.right_bottom()],
         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(52, 56, 64)),
     );
-    if let Some(action) = render_track_header_controls(ui, header_rect, track) {
+    if let Some(action) = render_track_header_controls(ui, header_rect, track, recording_track_id) {
         actions.push(action);
     }
 
     draw_lane_grid(&painter, lane_rect);
     draw_playhead(&painter, lane_rect, playhead, timeline_samples);
-    let lane_response = ui.interact(
-        lane_rect,
-        egui::Id::new(("lane", track.id.to_string())),
-        egui::Sense::click(),
-    );
-    if let Some(position) = lane_response
-        .interact_pointer_pos()
-        .filter(|_| lane_response.clicked())
-    {
-        actions.push(ArrangementAction::SetPlayhead(sample_from_x(
-            position.x,
-            lane_rect,
-            timeline_samples,
-        )));
-    }
 
+    let mut clip_rects = Vec::new();
     for clip in &track.clips {
-        if let Some(action) = render_clip(
+        let result = render_clip(
             ui,
             project,
             media_objects,
@@ -1019,9 +1039,15 @@ fn render_track_lane(
             clip,
             timeline_samples,
             selected_clip_id,
-        ) {
+        );
+        clip_rects.push(result.rect);
+        if let Some(action) = result.action {
             actions.push(action);
         }
+    }
+
+    if let Some(sample) = lane_pointer_sample(ui, lane_rect, &clip_rects, timeline_samples) {
+        actions.push(ArrangementAction::SetPlayhead(sample));
     }
 
     if let Some(live_recording) = live_recording.filter(|preview| preview.track_id == track.id) {
@@ -1035,6 +1061,7 @@ fn render_track_header_controls(
     ui: &mut egui::Ui,
     header_rect: egui::Rect,
     track: &daw_model::Track,
+    recording_track_id: &str,
 ) -> Option<ArrangementAction> {
     let painter = ui.painter_at(header_rect);
     painter.text(
@@ -1084,6 +1111,25 @@ fn render_track_header_controls(
             egui::Color32::from_rgb(57, 61, 69)
         }),
     );
+    let armed = recording_track_id == track.id.to_string();
+    let arm_response = ui.put(
+        egui::Rect::from_min_size(
+            header_rect.left_top() + egui::vec2(104.0, 58.0),
+            egui::vec2(46.0, 24.0),
+        ),
+        egui::Button::new("Rec").fill(if armed {
+            egui::Color32::from_rgb(150, 42, 52)
+        } else {
+            egui::Color32::from_rgb(57, 61, 69)
+        }),
+    );
+    let remove_response = ui.put(
+        egui::Rect::from_min_size(
+            header_rect.left_top() + egui::vec2(202.0, 58.0),
+            egui::vec2(42.0, 24.0),
+        ),
+        egui::Button::new("Del").fill(egui::Color32::from_rgb(68, 48, 52)),
+    );
 
     let muted = if muted_response.clicked() {
         !track.muted
@@ -1095,6 +1141,12 @@ fn render_track_header_controls(
     } else {
         track.solo
     };
+    if arm_response.clicked() {
+        return Some(ArrangementAction::ArmTrack(track.id.clone()));
+    }
+    if remove_response.clicked() {
+        return Some(ArrangementAction::RemoveTrack(track.id.clone()));
+    }
     let volume_changed = volume_response.changed();
     if volume_changed || muted != track.muted || solo != track.solo {
         Some(ArrangementAction::SetTrackControls {
@@ -1130,6 +1182,47 @@ fn draw_playhead(painter: &egui::Painter, rect: egui::Rect, playhead: u64, timel
     );
 }
 
+fn lane_pointer_sample(
+    ui: &egui::Ui,
+    lane_rect: egui::Rect,
+    clip_rects: &[egui::Rect],
+    timeline_samples: u64,
+) -> Option<u64> {
+    let pointer = ui.input(|input| input.pointer.clone());
+    if !pointer.primary_down() {
+        return None;
+    }
+    let position = pointer.latest_pos()?;
+    if !lane_rect.contains(position) || clip_rects.iter().any(|rect| rect.contains(position)) {
+        return None;
+    }
+    Some(sample_from_x(position.x, lane_rect, timeline_samples))
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn clip_rect(
+    lane_rect: egui::Rect,
+    start_sample: u64,
+    duration_samples: u64,
+    timeline_samples: u64,
+) -> egui::Rect {
+    let start_fraction = start_sample as f32 / timeline_samples.max(1) as f32;
+    let end_sample = start_sample.saturating_add(duration_samples);
+    let end_fraction = end_sample as f32 / timeline_samples.max(1) as f32;
+    let x1 = egui::lerp(
+        lane_rect.left()..=lane_rect.right(),
+        start_fraction.clamp(0.0, 1.0),
+    );
+    let x2 = egui::lerp(
+        lane_rect.left()..=lane_rect.right(),
+        end_fraction.clamp(0.0, 1.0),
+    );
+    egui::Rect::from_min_max(
+        egui::pos2(x1, lane_rect.top() + 12.0),
+        egui::pos2(x2.max(x1 + 8.0), lane_rect.bottom() - 12.0),
+    )
+}
+
 #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 fn render_clip(
     ui: &mut egui::Ui,
@@ -1140,22 +1233,13 @@ fn render_clip(
     clip: &daw_model::Clip,
     timeline_samples: u64,
     selected_clip_id: Option<&daw_model::StableId>,
-) -> Option<ArrangementAction> {
+) -> ClipRenderResult {
     let painter = ui.painter_at(lane_rect);
-    let start_fraction = clip.start_sample as f32 / timeline_samples.max(1) as f32;
-    let end_sample = clip.start_sample.saturating_add(clip.duration_samples);
-    let end_fraction = end_sample as f32 / timeline_samples.max(1) as f32;
-    let x1 = egui::lerp(
-        lane_rect.left()..=lane_rect.right(),
-        start_fraction.clamp(0.0, 1.0),
-    );
-    let x2 = egui::lerp(
-        lane_rect.left()..=lane_rect.right(),
-        end_fraction.clamp(0.0, 1.0),
-    );
-    let clip_rect = egui::Rect::from_min_max(
-        egui::pos2(x1, lane_rect.top() + 12.0),
-        egui::pos2(x2.max(x1 + 8.0), lane_rect.bottom() - 12.0),
+    let clip_rect = clip_rect(
+        lane_rect,
+        clip.start_sample,
+        clip.duration_samples,
+        timeline_samples,
     );
     let response = ui.interact(
         clip_rect,
@@ -1163,8 +1247,11 @@ fn render_clip(
         egui::Sense::click_and_drag(),
     );
     let selected = selected_clip_id == Some(&clip.id);
+    let drag_delta = response
+        .total_drag_delta()
+        .map_or(response.drag_delta(), |delta| delta);
     let draw_rect = if response.dragged() {
-        clip_rect.translate(egui::vec2(response.drag_delta().x, 0.0))
+        clip_rect.translate(egui::vec2(drag_delta.x, 0.0))
     } else {
         clip_rect
     };
@@ -1219,23 +1306,36 @@ fn render_clip(
     }
 
     if response.clicked() {
-        return Some(ArrangementAction::SelectClip(clip.id.clone()));
+        return ClipRenderResult {
+            rect: clip_rect,
+            action: Some(ArrangementAction::SelectClip(clip.id.clone())),
+        };
+    }
+
+    if response.drag_started() {
+        return ClipRenderResult {
+            rect: clip_rect,
+            action: Some(ArrangementAction::SelectClip(clip.id.clone())),
+        };
     }
 
     if response.drag_stopped() {
-        let delta_pixels = response
-            .total_drag_delta()
-            .map_or(response.drag_delta().x, |delta| delta.x);
-        let delta_samples = pixels_to_samples(delta_pixels, lane_rect.width(), timeline_samples);
+        let delta_samples = pixels_to_samples(drag_delta.x, lane_rect.width(), timeline_samples);
         let start_sample = apply_sample_delta(clip.start_sample, delta_samples);
-        return Some(ArrangementAction::MoveClip(ClipMoveRequest {
-            clip_id: clip.id.clone(),
-            start_sample,
-            duration_samples: clip.duration_samples,
-        }));
+        return ClipRenderResult {
+            rect: clip_rect,
+            action: Some(ArrangementAction::MoveClip(ClipMoveRequest {
+                clip_id: clip.id.clone(),
+                start_sample,
+                duration_samples: clip.duration_samples,
+            })),
+        };
     }
 
-    None
+    ClipRenderResult {
+        rect: clip_rect,
+        action: None,
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]

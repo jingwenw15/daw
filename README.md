@@ -260,8 +260,20 @@ cargo run --bin daw-ui
 Playback now advances the visible playhead cursor. The UI remembers the sample
 where playback started, polls the playback transport, and updates the playhead
 while audio is running. Recording also advances the visible playhead from the
-live capture buffer, and clip dragging uses total drag distance with arrangement
-drag-to-scroll disabled so recorded clips can be moved reliably.
+live capture buffer. Clip dragging uses clip-specific hit testing and total drag
+distance, while empty lane/ruler dragging scrubs the playhead cursor.
+
+```sh
+cargo run --bin daw-ui
+```
+
+## Stage 23
+
+Track and media cleanup are command-log-backed. Removing a clip prunes media
+references that no remaining clip uses, so project media counts stay aligned
+with the visible arrangement. Tracks can be removed from the UI track header,
+which also removes their clips and prunes now-unused media. Track headers also
+include a `Rec` arm button so recordings can target a specific track.
 
 ```sh
 cargo run --bin daw-ui
