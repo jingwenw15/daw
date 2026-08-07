@@ -242,3 +242,27 @@ strip for status and advanced project tools.
 ```sh
 cargo run --bin daw-ui
 ```
+
+## Stage 21
+
+Timeline navigation and clip editing are more usable. The transport exposes a
+horizontal zoom slider, the arrangement scrolls when zoomed in, clips can be
+selected with a highlighted state, and the bottom utility strip shows selected
+clip timing. Pressing Space toggles play/stop, and pressing Delete or Backspace
+removes the selected clip through the command log.
+
+```sh
+cargo run --bin daw-ui
+```
+
+## Stage 22
+
+Playback now advances the visible playhead cursor. The UI remembers the sample
+where playback started, polls the playback transport, and updates the playhead
+while audio is running. Recording also advances the visible playhead from the
+live capture buffer, and clip dragging uses total drag distance with arrangement
+drag-to-scroll disabled so recorded clips can be moved reliably.
+
+```sh
+cargo run --bin daw-ui
+```
