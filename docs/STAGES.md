@@ -299,3 +299,15 @@ command-log-backed move instead of relying on the original hit rectangle.
 ```sh
 cargo run --bin daw-ui
 ```
+
+## Stage 26
+
+Clip movement can now cross tracks. Dragging an audio clip vertically into
+another track lane updates the live preview, and releasing commits a
+command-log-backed placement change with both the target track and timeline
+start. Recorded snippets use the same clip model after capture, so they can be
+moved between tracks too.
+
+```sh
+cargo run --bin daw-ui
+```

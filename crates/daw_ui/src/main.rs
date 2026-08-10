@@ -71,6 +71,8 @@ struct ActivePlayback {
 #[derive(Clone, Debug)]
 struct ActiveClipDrag {
     clip_id: daw_model::StableId,
+    original_track_id: daw_model::StableId,
+    current_track_id: daw_model::StableId,
     original_start_sample: u64,
     duration_samples: u64,
     current_start_sample: u64,
@@ -88,6 +90,7 @@ struct LiveRecordingPreview {
 #[derive(Clone, Debug)]
 struct ClipMoveRequest {
     clip_id: daw_model::StableId,
+    track_id: daw_model::StableId,
     start_sample: u64,
     duration_samples: u64,
 }
@@ -101,11 +104,13 @@ struct ClipRenderResult {
 enum ArrangementAction {
     BeginClipDrag {
         clip_id: daw_model::StableId,
+        track_id: daw_model::StableId,
         start_sample: u64,
         duration_samples: u64,
         pointer_x: f32,
     },
     UpdateClipDrag {
+        track_id: daw_model::StableId,
         pointer_x: f32,
         lane_width: f32,
         timeline_samples: u64,
@@ -658,14 +663,18 @@ impl DawApp {
 
     fn commit_clip_move(&mut self, request: &ClipMoveRequest) {
         let path = PathBuf::from(&self.project_path);
-        match daw_model::set_clip_placement(
+        match daw_model::set_clip_placement_on_track(
             &path,
             &request.clip_id,
+            Some(&request.track_id),
             request.start_sample,
             request.duration_samples,
         ) {
             Ok(clip) => {
-                self.status = format!("Moved clip {} to {}", clip.id, clip.start_sample);
+                self.status = format!(
+                    "Moved clip {} to track {} at {}",
+                    clip.id, request.track_id, clip.start_sample
+                );
                 self.set_clip_edit_fields(&clip);
                 self.reload_project();
             }
@@ -677,6 +686,7 @@ impl DawApp {
         match action {
             ArrangementAction::BeginClipDrag {
                 clip_id,
+                track_id,
                 start_sample,
                 duration_samples,
                 pointer_x,
@@ -687,6 +697,8 @@ impl DawApp {
                 self.edit_clip_duration_samples = duration_samples.to_string();
                 self.clip_drag = Some(ActiveClipDrag {
                     clip_id: clip_id.clone(),
+                    original_track_id: track_id.clone(),
+                    current_track_id: track_id.clone(),
                     original_start_sample: *start_sample,
                     duration_samples: *duration_samples,
                     current_start_sample: *start_sample,
@@ -695,11 +707,13 @@ impl DawApp {
                 self.status = format!("Dragging clip {clip_id}");
             }
             ArrangementAction::UpdateClipDrag {
+                track_id,
                 pointer_x,
                 lane_width,
                 timeline_samples,
             } => {
                 if let Some(drag) = &mut self.clip_drag {
+                    drag.current_track_id = track_id.clone();
                     let delta_pixels = *pointer_x - drag.start_pointer_x;
                     let delta_samples =
                         pixels_to_samples(delta_pixels, *lane_width, *timeline_samples);
@@ -711,9 +725,12 @@ impl DawApp {
             }
             ArrangementAction::EndClipDrag => {
                 if let Some(drag) = self.clip_drag.take() {
-                    if drag.current_start_sample != drag.original_start_sample {
+                    if drag.current_start_sample != drag.original_start_sample
+                        || drag.current_track_id != drag.original_track_id
+                    {
                         self.commit_clip_move(&ClipMoveRequest {
                             clip_id: drag.clip_id,
+                            track_id: drag.current_track_id,
                             start_sample: drag.current_start_sample,
                             duration_samples: drag.duration_samples,
                         });
@@ -1046,6 +1063,13 @@ fn render_arrangement(
                 ));
             }
 
+            if active_clip_drag.is_some() {
+                let primary_down = ui.input(|input| input.pointer.primary_down());
+                if !primary_down {
+                    actions.push(ArrangementAction::EndClipDrag);
+                }
+            }
+
             if project.tracks.is_empty() {
                 ui.add_space(32.0);
                 ui.centered_and_justified(|ui| {
@@ -1157,12 +1181,22 @@ fn render_track_lane(
 
     let mut clip_rects = Vec::new();
     for clip in &track.clips {
+        if active_clip_drag.is_some_and(|drag| drag.clip_id == clip.id) {
+            clip_rects.push(clip_rect(
+                lane_rect,
+                clip.start_sample,
+                clip.duration_samples,
+                timeline_samples,
+            ));
+            continue;
+        }
         let result = render_clip(
             ui,
             project,
             media_objects,
             waveforms,
             lane_rect,
+            &track.id,
             clip,
             timeline_samples,
             selected_clip_id,
@@ -1177,6 +1211,25 @@ fn render_track_lane(
     if active_clip_drag.is_none() {
         if let Some(sample) = lane_pointer_sample(ui, lane_rect, &clip_rects, timeline_samples) {
             actions.push(ArrangementAction::SetPlayhead(sample));
+        }
+    }
+
+    if let Some(drag) = active_clip_drag {
+        if let Some(action) = update_clip_drag_in_lane(ui, rect, lane_rect, track, timeline_samples)
+        {
+            actions.push(action);
+        }
+        if drag.current_track_id == track.id {
+            render_active_clip_drag(
+                &painter,
+                project,
+                media_objects,
+                waveforms,
+                lane_rect,
+                drag,
+                timeline_samples,
+                selected_clip_id,
+            );
         }
     }
 
@@ -1343,6 +1396,29 @@ fn lane_pointer_sample(
     Some(sample_from_x(position.x, lane_rect, timeline_samples))
 }
 
+fn update_clip_drag_in_lane(
+    ui: &egui::Ui,
+    row_rect: egui::Rect,
+    lane_rect: egui::Rect,
+    track: &daw_model::Track,
+    timeline_samples: u64,
+) -> Option<ArrangementAction> {
+    let pointer = ui.input(|input| input.pointer.clone());
+    if !pointer.primary_down() {
+        return None;
+    }
+    let position = pointer.latest_pos()?;
+    if position.y < row_rect.top() || position.y > row_rect.bottom() {
+        return None;
+    }
+    Some(ArrangementAction::UpdateClipDrag {
+        track_id: track.id.clone(),
+        pointer_x: position.x,
+        lane_width: lane_rect.width(),
+        timeline_samples,
+    })
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn clip_rect(
     lane_rect: egui::Rect,
@@ -1367,6 +1443,92 @@ fn clip_rect(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_clip_body(
+    painter: &egui::Painter,
+    project: &daw_model::Project,
+    media_objects: &[daw_media::MediaObject],
+    waveforms: &[daw_media::WaveformSummary],
+    clip: &daw_model::Clip,
+    rect: egui::Rect,
+    selected: bool,
+    highlighted: bool,
+) {
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(49, 111, 120));
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(87, 180, 190)),
+        egui::StrokeKind::Inside,
+    );
+
+    let waveform = clip_waveform(project, waveforms, clip);
+    if let Some(waveform) = waveform {
+        draw_waveform(
+            painter,
+            rect.shrink2(egui::vec2(8.0, 14.0)),
+            &waveform.peaks,
+        );
+    } else {
+        let label = clip_media_label(project, media_objects, clip);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(218, 238, 240),
+        );
+    }
+
+    if highlighted || selected {
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(
+                2.0_f32,
+                if selected {
+                    egui::Color32::from_rgb(248, 231, 126)
+                } else {
+                    egui::Color32::from_rgb(235, 226, 150)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_active_clip_drag(
+    painter: &egui::Painter,
+    project: &daw_model::Project,
+    media_objects: &[daw_media::MediaObject],
+    waveforms: &[daw_media::WaveformSummary],
+    lane_rect: egui::Rect,
+    drag: &ActiveClipDrag,
+    timeline_samples: u64,
+    selected_clip_id: Option<&daw_model::StableId>,
+) {
+    let Some(clip) = selected_clip(project, Some(&drag.clip_id)) else {
+        return;
+    };
+    let rect = clip_rect(
+        lane_rect,
+        drag.current_start_sample,
+        drag.duration_samples,
+        timeline_samples,
+    );
+    draw_clip_body(
+        painter,
+        project,
+        media_objects,
+        waveforms,
+        clip,
+        rect,
+        selected_clip_id == Some(&drag.clip_id),
+        true,
+    );
+}
+
 #[allow(
     clippy::cast_precision_loss,
     clippy::too_many_arguments,
@@ -1378,6 +1540,7 @@ fn render_clip(
     media_objects: &[daw_media::MediaObject],
     waveforms: &[daw_media::WaveformSummary],
     lane_rect: egui::Rect,
+    track_id: &daw_model::StableId,
     clip: &daw_model::Clip,
     timeline_samples: u64,
     selected_clip_id: Option<&daw_model::StableId>,
@@ -1408,54 +1571,16 @@ fn render_clip(
         base_clip_rect
     };
 
-    painter.rect_filled(draw_rect, 4.0, egui::Color32::from_rgb(49, 111, 120));
-    painter.rect_stroke(
+    draw_clip_body(
+        &painter,
+        project,
+        media_objects,
+        waveforms,
+        clip,
         draw_rect,
-        4.0,
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(87, 180, 190)),
-        egui::StrokeKind::Inside,
+        selected,
+        this_clip_drag.is_some() || response.hovered(),
     );
-
-    let waveform = clip_waveform(project, waveforms, clip);
-    if let Some(waveform) = waveform {
-        draw_waveform(
-            &painter,
-            draw_rect.shrink2(egui::vec2(8.0, 14.0)),
-            &waveform.peaks,
-        );
-    } else {
-        let label = clip_media_label(project, media_objects, clip);
-        painter.text(
-            draw_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(12.0),
-            egui::Color32::from_rgb(218, 238, 240),
-        );
-    }
-    if this_clip_drag.is_some() || response.hovered() {
-        painter.rect_stroke(
-            draw_rect,
-            4.0,
-            egui::Stroke::new(
-                2.0_f32,
-                if selected {
-                    egui::Color32::from_rgb(248, 231, 126)
-                } else {
-                    egui::Color32::from_rgb(235, 226, 150)
-                },
-            ),
-            egui::StrokeKind::Inside,
-        );
-    }
-    if selected && this_clip_drag.is_none() && !response.hovered() {
-        painter.rect_stroke(
-            draw_rect,
-            4.0,
-            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(248, 231, 126)),
-            egui::StrokeKind::Inside,
-        );
-    }
 
     if let Some(drag) = this_clip_drag {
         let mouse_pointer = ui.input(|input| input.pointer.clone());
@@ -1464,6 +1589,7 @@ fn render_clip(
                 return ClipRenderResult {
                     rect: base_clip_rect,
                     action: Some(ArrangementAction::UpdateClipDrag {
+                        track_id: track_id.clone(),
                         pointer_x: position.x,
                         lane_width: lane_rect.width(),
                         timeline_samples,
@@ -1489,6 +1615,7 @@ fn render_clip(
                 rect: base_clip_rect,
                 action: Some(ArrangementAction::BeginClipDrag {
                     clip_id: clip.id.clone(),
+                    track_id: track_id.clone(),
                     start_sample: clip.start_sample,
                     duration_samples: clip.duration_samples,
                     pointer_x: position.x,

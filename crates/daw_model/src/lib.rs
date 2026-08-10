@@ -135,6 +135,10 @@ pub enum ProjectCommand {
     SetClipPlacement {
         /// Clip receiving the placement settings.
         clip_id: StableId,
+        /// Optional track receiving the clip. Older command-log entries omit
+        /// this and keep the clip on its current track.
+        #[serde(default)]
+        track_id: Option<StableId>,
         /// Timeline start in samples.
         start_sample: u64,
         /// Clip duration in samples.
@@ -405,12 +409,19 @@ impl ProjectCommand {
             }
             Self::SetClipPlacement {
                 clip_id,
+                track_id,
                 start_sample,
                 duration_samples,
             } => {
-                format!(
-                    "set clip {clip_id} placement start={start_sample} duration={duration_samples}"
-                )
+                if let Some(track_id) = track_id {
+                    format!(
+                        "set clip {clip_id} placement track={track_id} start={start_sample} duration={duration_samples}"
+                    )
+                } else {
+                    format!(
+                        "set clip {clip_id} placement start={start_sample} duration={duration_samples}"
+                    )
+                }
             }
             Self::RemoveClip { clip_id } => format!("remove clip {clip_id}"),
             Self::SetTrackControls {
@@ -765,10 +776,27 @@ pub fn set_clip_placement(
     start_sample: u64,
     duration_samples: u64,
 ) -> Result<Clip, ProjectIoError> {
+    set_clip_placement_on_track(project_dir, clip_id, None, start_sample, duration_samples)
+}
+
+/// Move or resize an existing clip, optionally moving it to another track.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the clip or target track is
+/// unknown, the placement is invalid, or the updated project cannot be saved.
+pub fn set_clip_placement_on_track(
+    project_dir: &Path,
+    clip_id: &StableId,
+    track_id: Option<&StableId>,
+    start_sample: u64,
+    duration_samples: u64,
+) -> Result<Clip, ProjectIoError> {
     append_and_apply(
         project_dir,
         ProjectCommand::SetClipPlacement {
             clip_id: clip_id.clone(),
+            track_id: track_id.cloned(),
             start_sample,
             duration_samples,
         },
@@ -1071,9 +1099,16 @@ fn apply_command(
         ProjectCommand::AddClip { track_id, clip } => apply_add_clip(project, track_id, clip),
         ProjectCommand::SetClipPlacement {
             clip_id,
+            track_id,
             start_sample,
             duration_samples,
-        } => apply_set_clip_placement(project, clip_id, *start_sample, *duration_samples),
+        } => apply_set_clip_placement(
+            project,
+            clip_id,
+            track_id.as_ref(),
+            *start_sample,
+            *duration_samples,
+        ),
         ProjectCommand::RemoveClip { clip_id } => apply_remove_clip(project, clip_id),
         ProjectCommand::SetTrackControls {
             track_id,
@@ -1110,14 +1145,46 @@ fn apply_add_clip(
 fn apply_set_clip_placement(
     mut project: Project,
     clip_id: &StableId,
+    track_id: Option<&StableId>,
     start_sample: u64,
     duration_samples: u64,
 ) -> Result<Project, ProjectIoError> {
-    let clip = find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?;
+    let clip = if let Some(track_id) = track_id {
+        move_clip_to_track(&mut project, clip_id, track_id)?
+    } else {
+        find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?
+    };
     clip.start_sample = start_sample;
     clip.duration_samples = duration_samples;
     sort_track_clips(&mut project);
     validate_project_state(project)
+}
+
+fn move_clip_to_track<'a>(
+    project: &'a mut Project,
+    clip_id: &StableId,
+    target_track_id: &StableId,
+) -> Result<&'a mut Clip, ProjectIoError> {
+    let target_index = project
+        .tracks
+        .iter()
+        .position(|track| track.id == *target_track_id)
+        .ok_or_else(|| unknown_track_error(target_track_id))?;
+    let source_index = project
+        .tracks
+        .iter()
+        .position(|track| track.clips.iter().any(|clip| clip.id == *clip_id))
+        .ok_or_else(|| unknown_clip_error(clip_id))?;
+    let clip_index = project.tracks[source_index]
+        .clips
+        .iter()
+        .position(|clip| clip.id == *clip_id)
+        .ok_or_else(|| unknown_clip_error(clip_id))?;
+    if source_index != target_index {
+        let clip = project.tracks[source_index].clips.remove(clip_index);
+        project.tracks[target_index].clips.push(clip);
+    }
+    find_clip_mut(project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))
 }
 
 fn apply_remove_clip(mut project: Project, clip_id: &StableId) -> Result<Project, ProjectIoError> {
@@ -1390,8 +1457,8 @@ mod tests {
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
         project_file_path, remove_clip, remove_track, replay_project, set_clip_placement,
-        set_track_controls, set_track_name, switch_branch, Project, ProjectIoError, StableId,
-        Track, PROJECT_SCHEMA_VERSION,
+        set_clip_placement_on_track, set_track_controls, set_track_name, switch_branch, Project,
+        ProjectIoError, StableId, Track, PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1596,6 +1663,32 @@ mod tests {
         assert_eq!(removed, first_clip);
         assert_eq!(project.tracks[0].clips, vec![edited]);
         assert_eq!(project.media, vec![media]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn moves_clip_between_tracks_through_command_log() {
+        let project_dir = temp_project_dir("clip-cross-track");
+        init_project(&project_dir, "Cross Track Clip").expect("init project");
+        let source = add_track(&project_dir, "Source").expect("add source track");
+        let target = add_track(&project_dir, "Target").expect("add target track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &source.id, &media.id, 48_000, 24_000).expect("add clip");
+
+        let moved =
+            set_clip_placement_on_track(&project_dir, &clip.id, Some(&target.id), 12_000, 36_000)
+                .expect("move clip to target track");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(moved.id, clip.id);
+        assert_eq!(moved.start_sample, 12_000);
+        assert_eq!(moved.duration_samples, 36_000);
+        assert!(project.tracks[0].clips.is_empty());
+        assert_eq!(project.tracks[1].clips, vec![moved]);
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");
