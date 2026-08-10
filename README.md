@@ -278,3 +278,23 @@ include a `Rec` arm button so recordings can target a specific track.
 ```sh
 cargo run --bin daw-ui
 ```
+
+## Stage 24
+
+Tracks can be renamed inline from the arrangement track header. Renames are
+stored as command-log-backed edits and replay correctly, keeping track names
+version-control-friendly instead of UI-only state.
+
+```sh
+cargo run --bin daw-ui
+```
+
+## Stage 25
+
+Clip dragging is now stateful across UI frames. Press and hold a waveform clip,
+drag it horizontally to a new timeline position, and release to commit one
+command-log-backed move instead of relying on the original hit rectangle.
+
+```sh
+cargo run --bin daw-ui
+```

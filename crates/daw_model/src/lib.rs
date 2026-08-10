@@ -112,6 +112,13 @@ pub enum ProjectCommand {
         /// Track to remove.
         track_id: StableId,
     },
+    /// Rename a timeline track.
+    SetTrackName {
+        /// Track receiving the new name.
+        track_id: StableId,
+        /// New human-readable track name.
+        name: String,
+    },
     /// Add or update a media reference.
     AddMediaReference {
         /// Media reference to store.
@@ -384,6 +391,9 @@ impl ProjectCommand {
         match self {
             Self::AddTrack { track } => format!("add track '{}'", track.name),
             Self::RemoveTrack { track_id } => format!("remove track {track_id}"),
+            Self::SetTrackName { track_id, name } => {
+                format!("rename track {track_id} to '{name}'")
+            }
             Self::AddMediaReference { media } => {
                 format!(
                     "add media {}",
@@ -662,6 +672,32 @@ pub fn remove_track(project_dir: &Path, track_id: &StableId) -> Result<Track, Pr
         },
     )?;
     Ok(removed)
+}
+
+/// Rename a track through the command log.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the track is unknown, or
+/// the updated project cannot be saved.
+pub fn set_track_name(
+    project_dir: &Path,
+    track_id: &StableId,
+    name: &str,
+) -> Result<Track, ProjectIoError> {
+    append_and_apply(
+        project_dir,
+        ProjectCommand::SetTrackName {
+            track_id: track_id.clone(),
+            name: name.to_owned(),
+        },
+    )?;
+    let project = load_project(project_dir)?;
+    project
+        .tracks
+        .into_iter()
+        .find(|track| track.id == *track_id)
+        .ok_or_else(|| unknown_track_error(track_id))
 }
 
 /// Add or update a media reference through the command log.
@@ -1017,6 +1053,9 @@ fn apply_command(
             validate_project_state(project)
         }
         ProjectCommand::RemoveTrack { track_id } => apply_remove_track(project, track_id),
+        ProjectCommand::SetTrackName { track_id, name } => {
+            apply_set_track_name(project, track_id, name)
+        }
         ProjectCommand::AddMediaReference { media } => {
             if let Some(existing) = project
                 .media
@@ -1106,6 +1145,20 @@ fn apply_remove_track(
         return Err(unknown_track_error(track_id));
     }
     prune_unused_media_references(&mut project);
+    validate_project_state(project)
+}
+
+fn apply_set_track_name(
+    mut project: Project,
+    track_id: &StableId,
+    name: &str,
+) -> Result<Project, ProjectIoError> {
+    let track = project
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == *track_id)
+        .ok_or_else(|| unknown_track_error(track_id))?;
+    name.clone_into(&mut track.name);
     validate_project_state(project)
 }
 
@@ -1337,8 +1390,8 @@ mod tests {
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
         project_file_path, remove_clip, remove_track, replay_project, set_clip_placement,
-        set_track_controls, switch_branch, Project, ProjectIoError, StableId, Track,
-        PROJECT_SCHEMA_VERSION,
+        set_track_controls, set_track_name, switch_branch, Project, ProjectIoError, StableId,
+        Track, PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1498,6 +1551,23 @@ mod tests {
         assert!(updated.muted);
         assert!(!updated.solo);
         assert_eq!(project.tracks[0], updated);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn renames_track_through_command_log() {
+        let project_dir = temp_project_dir("track-name");
+        init_project(&project_dir, "Track Name").expect("init project");
+        let track = add_track(&project_dir, "Scratch").expect("add track");
+
+        let updated = set_track_name(&project_dir, &track.id, "Vocals").expect("rename track");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(updated.name, "Vocals");
+        assert_eq!(project.tracks[0].name, "Vocals");
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");
