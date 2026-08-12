@@ -55,6 +55,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                     .map_err(|error| format!("failed to inspect project: {error}"))?,
             )
         }
+        Some("project") => run_project(args),
         Some("track") => run_track(args),
         Some("clip") => run_clip(args),
         Some("snapshot") => run_snapshot(args),
@@ -365,6 +366,24 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "unknown clip command: {command}\nrun `daw --help` for usage"
         )),
         None => Err("missing clip command\nrun `daw --help` for usage".to_owned()),
+    }
+}
+
+fn run_project(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    match args.next().as_deref() {
+        Some("tempo") => {
+            let path = required_arg(&mut args, "path")?;
+            let tempo_bpm = required_u16(&mut args, "tempo-bpm")?;
+            no_extra_args(args)?;
+            let project = daw_model::set_project_tempo(path.as_ref(), tempo_bpm)
+                .map_err(|error| format!("failed to set project tempo: {error}"))?;
+            println!("set project tempo to {} BPM", project.tempo_bpm);
+            Ok(())
+        }
+        Some(command) => Err(format!(
+            "unknown project command: {command}\nrun `daw --help` for usage"
+        )),
+        None => Err("missing project command\nrun `daw --help` for usage".to_owned()),
     }
 }
 
@@ -737,6 +756,7 @@ fn print_help() {
     println!("  daw init <path> [name]");
     println!("  daw validate <path>");
     println!("  daw inspect <path>");
+    println!("  daw project tempo <path> <tempo-bpm>");
     println!("  daw track add <path> <name>");
     println!("  daw track controls <path> <track-id> <volume-percent> <muted> <solo>");
     println!("  daw clip add <path> <track-id> <media-id> <start-sample> <duration-samples>");

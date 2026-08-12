@@ -23,6 +23,7 @@ platform is macOS, with the architecture kept portable where practical.
 - Track creation, deletion, renaming, arming, volume, mute, and solo controls.
 - Audio recording from the default input device.
 - Timeline playback from a movable playhead.
+- Command-log-backed project tempo.
 - Imported WAV media, waveform cache generation, and waveform drawing.
 - Clip selection, deletion, command-log-backed placement edits, and horizontal
   timeline dragging.

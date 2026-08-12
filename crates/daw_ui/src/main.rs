@@ -23,6 +23,7 @@ struct DawApp {
     project_path: String,
     new_project_name: String,
     new_track_name: String,
+    project_tempo_bpm: u16,
     playhead_sample: String,
     media_source_path: String,
     clip_track_id: String,
@@ -142,6 +143,7 @@ impl Default for DawApp {
             project_path: "/private/tmp/daw-ui-project".to_owned(),
             new_project_name: "UI Project".to_owned(),
             new_track_name: "Audio".to_owned(),
+            project_tempo_bpm: daw_model::DEFAULT_TEMPO_BPM,
             playhead_sample: "0".to_owned(),
             media_source_path: "/private/tmp/test-tone.wav".to_owned(),
             clip_track_id: String::new(),
@@ -215,6 +217,16 @@ impl DawApp {
                         .logarithmic(true)
                         .show_value(false),
                 );
+                ui.label("Tempo");
+                ui.add(
+                    egui::DragValue::new(&mut self.project_tempo_bpm)
+                        .range(20..=300)
+                        .speed(1.0)
+                        .suffix(" BPM"),
+                );
+                if ui.button("Set Tempo").clicked() {
+                    self.set_project_tempo();
+                }
                 ui.checkbox(&mut self.snap_enabled, "Snap");
                 ui.add_enabled(
                     self.snap_enabled,
@@ -391,6 +403,7 @@ impl DawApp {
                     if self.recording.is_some() {
                         ui.colored_label(egui::Color32::from_rgb(220, 72, 82), "recording");
                     }
+                    ui.label(format!("{} BPM", project.tempo_bpm));
                     ui.label(format!("{} tracks", project.tracks.len()));
                     ui.label(format!("{} media", project.media.len()));
                 });
@@ -430,6 +443,7 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::init_project(&path, &self.new_project_name) {
             Ok(project) => {
+                self.project_tempo_bpm = project.tempo_bpm;
                 self.project = Some(project);
                 self.clip_drag = None;
                 self.status = format!("Created project at {}", path.display());
@@ -443,6 +457,7 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::load_project(&path) {
             Ok(project) => {
+                self.project_tempo_bpm = project.tempo_bpm;
                 self.project = Some(project);
                 self.clip_drag = None;
                 self.status = format!("Opened {}", path.display());
@@ -467,6 +482,7 @@ impl DawApp {
         if replayed != project {
             return Err("command replay differs from saved project".to_owned());
         }
+        self.project_tempo_bpm = project.tempo_bpm;
         self.project = Some(project);
         self.clip_drag = None;
         self.reload_auxiliary();
@@ -502,6 +518,20 @@ impl DawApp {
                 self.refresh_project_after_edit(format!("Added track '{}'", track.name));
             }
             Err(error) => self.status = format!("Add track failed: {error}"),
+        }
+    }
+
+    fn set_project_tempo(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::set_project_tempo(&path, self.project_tempo_bpm) {
+            Ok(project) => {
+                self.project_tempo_bpm = project.tempo_bpm;
+                self.refresh_project_after_edit(format!(
+                    "Set project tempo to {} BPM",
+                    project.tempo_bpm
+                ));
+            }
+            Err(error) => self.status = format!("Set tempo failed: {error}"),
         }
     }
 

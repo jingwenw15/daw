@@ -33,6 +33,9 @@ pub const ACTIVE_BRANCH_FILE_NAME: &str = "active_branch.txt";
 /// Default branch name for new projects.
 pub const DEFAULT_BRANCH_NAME: &str = "main";
 
+/// Default project tempo in quarter-note beats per minute.
+pub const DEFAULT_TEMPO_BPM: u16 = 120;
+
 static NEXT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// User-editable project document persisted to `project.daw.json`.
@@ -44,6 +47,9 @@ pub struct Project {
     pub id: StableId,
     /// Human-readable project name.
     pub name: String,
+    /// Project tempo in quarter-note beats per minute.
+    #[serde(default = "default_project_tempo_bpm")]
+    pub tempo_bpm: u16,
     /// Track list in timeline order.
     pub tracks: Vec<Track>,
     /// Media references known to the project.
@@ -118,6 +124,11 @@ pub enum ProjectCommand {
         track_id: StableId,
         /// New human-readable track name.
         name: String,
+    },
+    /// Set the project tempo.
+    SetProjectTempo {
+        /// Quarter-note beats per minute.
+        tempo_bpm: u16,
     },
     /// Add or update a media reference.
     AddMediaReference {
@@ -258,6 +269,7 @@ impl Project {
             schema_version: PROJECT_SCHEMA_VERSION,
             id: StableId::new(),
             name: name.into(),
+            tempo_bpm: default_project_tempo_bpm(),
             tracks: Vec::new(),
             media: Vec::new(),
         }
@@ -277,6 +289,9 @@ impl Project {
 
         if self.name.trim().is_empty() {
             errors.push(ValidationError::new("project name must not be empty"));
+        }
+        if !(20..=300).contains(&self.tempo_bpm) {
+            errors.push(ValidationError::new("tempo_bpm must be between 20 and 300"));
         }
 
         let mut track_ids = Vec::with_capacity(self.tracks.len());
@@ -398,6 +413,7 @@ impl ProjectCommand {
             Self::SetTrackName { track_id, name } => {
                 format!("rename track {track_id} to '{name}'")
             }
+            Self::SetProjectTempo { tempo_bpm } => format!("set project tempo to {tempo_bpm} BPM"),
             Self::AddMediaReference { media } => {
                 format!(
                     "add media {}",
@@ -709,6 +725,16 @@ pub fn set_track_name(
         .into_iter()
         .find(|track| track.id == *track_id)
         .ok_or_else(|| unknown_track_error(track_id))
+}
+
+/// Set project tempo through the command log.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the tempo is invalid, or
+/// the updated project cannot be saved.
+pub fn set_project_tempo(project_dir: &Path, tempo_bpm: u16) -> Result<Project, ProjectIoError> {
+    append_and_apply(project_dir, ProjectCommand::SetProjectTempo { tempo_bpm })
 }
 
 /// Add or update a media reference through the command log.
@@ -1084,6 +1110,10 @@ fn apply_command(
         ProjectCommand::SetTrackName { track_id, name } => {
             apply_set_track_name(project, track_id, name)
         }
+        ProjectCommand::SetProjectTempo { tempo_bpm } => {
+            project.tempo_bpm = *tempo_bpm;
+            validate_project_state(project)
+        }
         ProjectCommand::AddMediaReference { media } => {
             if let Some(existing) = project
                 .media
@@ -1451,14 +1481,19 @@ fn default_track_volume_percent() -> u16 {
     100
 }
 
+fn default_project_tempo_bpm() -> u16 {
+    DEFAULT_TEMPO_BPM
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
         project_file_path, remove_clip, remove_track, replay_project, set_clip_placement,
-        set_clip_placement_on_track, set_track_controls, set_track_name, switch_branch, Project,
-        ProjectIoError, StableId, Track, PROJECT_SCHEMA_VERSION,
+        set_clip_placement_on_track, set_project_tempo, set_track_controls, set_track_name,
+        switch_branch, Project, ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM,
+        PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1473,6 +1508,7 @@ mod tests {
             schema_version: PROJECT_SCHEMA_VERSION,
             id: StableId::from_string("project-id"),
             name: "Session".to_owned(),
+            tempo_bpm: DEFAULT_TEMPO_BPM,
             tracks: vec![Track {
                 id: StableId::from_string("track-id"),
                 name: "Drums".to_owned(),
@@ -1488,7 +1524,7 @@ mod tests {
 
         assert_eq!(
             json,
-            "{\n  \"schema_version\": 1,\n  \"id\": \"project-id\",\n  \"name\": \"Session\",\n  \"tracks\": [\n    {\n      \"id\": \"track-id\",\n      \"name\": \"Drums\",\n      \"volume_percent\": 100,\n      \"muted\": false,\n      \"solo\": false,\n      \"clips\": []\n    }\n  ],\n  \"media\": []\n}\n"
+            "{\n  \"schema_version\": 1,\n  \"id\": \"project-id\",\n  \"name\": \"Session\",\n  \"tempo_bpm\": 120,\n  \"tracks\": [\n    {\n      \"id\": \"track-id\",\n      \"name\": \"Drums\",\n      \"volume_percent\": 100,\n      \"muted\": false,\n      \"solo\": false,\n      \"clips\": []\n    }\n  ],\n  \"media\": []\n}\n"
         );
     }
 
@@ -1499,6 +1535,7 @@ mod tests {
             schema_version: PROJECT_SCHEMA_VERSION,
             id: StableId::from_string("project-id"),
             name: "Session".to_owned(),
+            tempo_bpm: DEFAULT_TEMPO_BPM,
             tracks: vec![
                 Track {
                     id: duplicate_id.clone(),
@@ -1532,6 +1569,7 @@ mod tests {
         let project = init_project(&project_dir, "Layout").expect("init project");
 
         assert_eq!(project.name, "Layout");
+        assert_eq!(project.tempo_bpm, DEFAULT_TEMPO_BPM);
         assert!(project_file_path(&project_dir).is_file());
         assert!(project_dir.join("history").is_dir());
         assert!(project_dir.join("history").join("commands.jsonl").is_file());
@@ -1548,6 +1586,33 @@ mod tests {
         let loaded = load_project(&project_dir).expect("load project");
         assert_eq!(loaded, project);
 
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn sets_project_tempo_through_command_log() {
+        let project_dir = temp_project_dir("tempo");
+        init_project(&project_dir, "Tempo").expect("init project");
+
+        let updated = set_project_tempo(&project_dir, 96).expect("set tempo");
+        let loaded = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(updated.tempo_bpm, 96);
+        assert_eq!(loaded.tempo_bpm, 96);
+        assert_eq!(replayed, loaded);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn rejects_invalid_project_tempo() {
+        let project_dir = temp_project_dir("invalid-tempo");
+        init_project(&project_dir, "Tempo").expect("init project");
+
+        let result = set_project_tempo(&project_dir, 0);
+
+        assert!(matches!(result, Err(ProjectIoError::Invalid(_))));
         fs::remove_dir_all(project_dir).expect("cleanup project");
     }
 

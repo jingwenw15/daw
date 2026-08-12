@@ -338,3 +338,18 @@ tempo-aware editing can remain sample-accurate.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 29
+
+Projects now have command-log-backed tempo metadata. New projects default to
+120 BPM, validation rejects unusable tempo values, `daw project tempo` can edit
+the tempo from scripts, and the native UI exposes a transport BPM control that
+commits through the same verified reload path as other project edits. The
+timeline remains sample-based for now; tempo is the persistent foundation for
+bars/beats, metronome, MIDI, and drum sequencing.
+
+```sh
+cargo run --bin daw -- project tempo /tmp/my-session 96
+cargo test
+cargo run --bin daw-ui
+```
