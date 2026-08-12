@@ -311,3 +311,30 @@ moved between tracks too.
 ```sh
 cargo run --bin daw-ui
 ```
+
+## Stage 27
+
+Project edits now refresh through a verification path in the UI. After track,
+media, clip, recording, mixer, rename, and deletion edits, the app reloads the
+saved project, replays the command log, and preserves a status message that says
+whether the edit verified after reload. The model tests also cover a realistic
+record-like workflow: add clips, move one between tracks, delete media-bearing
+clips, remove a track, reload, and confirm replay matches each saved state.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 28
+
+The arrangement has a first-pass timeline snapping mode. The transport exposes a
+`Snap` toggle and millisecond grid size, the ruler and track lanes draw subtle
+snap grid lines, and playhead clicks plus clip dragging snap to the nearest grid
+sample. Project data still stores exact sample positions, so scripts and future
+tempo-aware editing can remain sample-accurate.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

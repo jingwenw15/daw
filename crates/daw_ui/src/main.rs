@@ -9,6 +9,7 @@ use std::{
 const TRACK_HEADER_WIDTH: f32 = 260.0;
 const TRACK_LANE_HEIGHT: f32 = 92.0;
 const MIN_TIMELINE_SAMPLES: u64 = 240_000;
+const DEFAULT_SNAP_GRID_MS: u32 = 250;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -38,6 +39,8 @@ struct DawApp {
     mixer_muted: bool,
     mixer_solo: bool,
     timeline_zoom: f32,
+    snap_enabled: bool,
+    snap_grid_ms: u32,
     selected_clip_id: Option<daw_model::StableId>,
     clip_drag: Option<ActiveClipDrag>,
     track_name_edits: BTreeMap<String, String>,
@@ -114,6 +117,7 @@ enum ArrangementAction {
         pointer_x: f32,
         lane_width: f32,
         timeline_samples: u64,
+        snap_grid_samples: Option<u64>,
     },
     EndClipDrag,
     SetPlayhead(u64),
@@ -154,6 +158,8 @@ impl Default for DawApp {
             mixer_muted: false,
             mixer_solo: false,
             timeline_zoom: 1.0,
+            snap_enabled: true,
+            snap_grid_ms: DEFAULT_SNAP_GRID_MS,
             selected_clip_id: None,
             clip_drag: None,
             track_name_edits: BTreeMap::new(),
@@ -208,6 +214,14 @@ impl DawApp {
                     egui::Slider::new(&mut self.timeline_zoom, 0.5..=8.0)
                         .logarithmic(true)
                         .show_value(false),
+                );
+                ui.checkbox(&mut self.snap_enabled, "Snap");
+                ui.add_enabled(
+                    self.snap_enabled,
+                    egui::DragValue::new(&mut self.snap_grid_ms)
+                        .range(10..=2_000)
+                        .speed(10.0)
+                        .suffix(" ms"),
                 );
                 if ui
                     .add_enabled(self.playback.is_none(), egui::Button::new("Play"))
@@ -390,6 +404,7 @@ impl DawApp {
                     &self.playhead_sample,
                     live_recording.as_ref(),
                     self.timeline_zoom,
+                    self.snap_grid_samples(),
                     self.selected_clip_id.as_ref(),
                     self.clip_drag.as_ref(),
                     &self.recording_track_id,
@@ -403,6 +418,12 @@ impl DawApp {
                 ui.label("Create or open a project, add a track, then press Record.");
             }
         });
+    }
+
+    fn snap_grid_samples(&self) -> Option<u64> {
+        self.snap_enabled
+            .then(|| snap_grid_samples_from_ms(self.snap_grid_ms))
+            .filter(|samples| *samples > 0)
     }
 
     fn create_project(&mut self) {
@@ -431,6 +452,27 @@ impl DawApp {
         }
     }
 
+    fn refresh_project_after_edit(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        match self.load_and_verify_project() {
+            Ok(()) => self.status = format!("{message} · verified after reload"),
+            Err(error) => self.status = format!("{message} · verification failed: {error}"),
+        }
+    }
+
+    fn load_and_verify_project(&mut self) -> Result<(), String> {
+        let path = PathBuf::from(&self.project_path);
+        let project = daw_model::load_project(&path).map_err(|error| error.to_string())?;
+        let replayed = daw_model::replay_project(&path).map_err(|error| error.to_string())?;
+        if replayed != project {
+            return Err("command replay differs from saved project".to_owned());
+        }
+        self.project = Some(project);
+        self.clip_drag = None;
+        self.reload_auxiliary();
+        Ok(())
+    }
+
     fn reload_auxiliary(&mut self) {
         let path = PathBuf::from(&self.project_path);
         self.media = daw_media::list_media(&path).unwrap_or_default();
@@ -454,11 +496,10 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::add_track(&path, &self.new_track_name) {
             Ok(track) => {
-                self.status = format!("Added track '{}'", track.name);
                 self.clip_track_id = track.id.to_string();
                 self.mixer_track_id = track.id.to_string();
                 self.recording_track_id = track.id.to_string();
-                self.reload_project();
+                self.refresh_project_after_edit(format!("Added track '{}'", track.name));
             }
             Err(error) => self.status = format!("Add track failed: {error}"),
         }
@@ -481,8 +522,10 @@ impl DawApp {
         ) {
             Ok(media) => {
                 self.clip_media_id = media.id.to_string();
-                self.status = format!("Imported {} bytes as {}", object.byte_size, object.hash);
-                self.reload_project();
+                self.refresh_project_after_edit(format!(
+                    "Imported {} bytes as {}",
+                    object.byte_size, object.hash
+                ));
             }
             Err(error) => self.status = format!("Media registration failed: {error}"),
         }
@@ -548,9 +591,8 @@ impl DawApp {
             duration_samples,
         ) {
             Ok(clip) => {
-                self.status = format!("Added clip {}", clip.id);
                 self.set_clip_edit_fields(&clip);
-                self.reload_project();
+                self.refresh_project_after_edit(format!("Added clip {}", clip.id));
             }
             Err(error) => self.status = format!("Add clip failed: {error}"),
         }
@@ -637,8 +679,7 @@ impl DawApp {
                         &report.media_hash,
                         daw_media::DEFAULT_WAVEFORM_POINTS,
                     );
-                    self.status = report.message;
-                    self.reload_project();
+                    self.refresh_project_after_edit(report.message);
                 }
                 Err(error) => self.status = format!("Record insert failed: {error}"),
             },
@@ -671,12 +712,12 @@ impl DawApp {
             request.duration_samples,
         ) {
             Ok(clip) => {
-                self.status = format!(
+                let message = format!(
                     "Moved clip {} to track {} at {}",
                     clip.id, request.track_id, clip.start_sample
                 );
                 self.set_clip_edit_fields(&clip);
-                self.reload_project();
+                self.refresh_project_after_edit(message);
             }
             Err(error) => self.status = format!("Move clip failed: {error}"),
         }
@@ -711,14 +752,17 @@ impl DawApp {
                 pointer_x,
                 lane_width,
                 timeline_samples,
+                snap_grid_samples,
             } => {
                 if let Some(drag) = &mut self.clip_drag {
                     drag.current_track_id = track_id.clone();
                     let delta_pixels = *pointer_x - drag.start_pointer_x;
                     let delta_samples =
                         pixels_to_samples(delta_pixels, *lane_width, *timeline_samples);
-                    drag.current_start_sample =
+                    let current_start_sample =
                         apply_sample_delta(drag.original_start_sample, delta_samples);
+                    drag.current_start_sample =
+                        snap_sample(current_start_sample, *snap_grid_samples);
                     self.edit_clip_start_sample = drag.current_start_sample.to_string();
                     self.playhead_sample = drag.current_start_sample.to_string();
                 }
@@ -781,12 +825,12 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::set_track_controls(&path, track_id, volume_percent, muted, solo) {
             Ok(track) => {
-                self.status = format!(
+                let message = format!(
                     "Set '{}' controls: volume={} muted={} solo={}",
                     track.name, track.volume_percent, track.muted, track.solo
                 );
                 self.set_mixer_fields_from_track(&track);
-                self.reload_project();
+                self.refresh_project_after_edit(message);
             }
             Err(error) => self.status = format!("Set controls failed: {error}"),
         }
@@ -801,10 +845,10 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::set_track_name(&path, track_id, name) {
             Ok(track) => {
-                self.status = format!("Renamed track to '{}'", track.name);
+                let message = format!("Renamed track to '{}'", track.name);
                 self.track_name_edits
                     .insert(track.id.to_string(), track.name.clone());
-                self.reload_project();
+                self.refresh_project_after_edit(message);
             }
             Err(error) => self.status = format!("Rename track failed: {error}"),
         }
@@ -890,11 +934,11 @@ impl DawApp {
             duration_samples,
         ) {
             Ok(clip) => {
-                self.status = format!(
+                let message = format!(
                     "Moved clip {} to {} for {}",
                     clip.id, clip.start_sample, clip.duration_samples
                 );
-                self.reload_project();
+                self.refresh_project_after_edit(message);
             }
             Err(error) => self.status = format!("Move clip failed: {error}"),
         }
@@ -907,12 +951,11 @@ impl DawApp {
             &daw_model::StableId::from_string(self.edit_clip_id.clone()),
         ) {
             Ok(clip) => {
-                self.status = format!("Removed clip {}", clip.id);
                 self.edit_clip_id.clear();
                 if self.selected_clip_id.as_ref() == Some(&clip.id) {
                     self.selected_clip_id = None;
                 }
-                self.reload_project();
+                self.refresh_project_after_edit(format!("Removed clip {}", clip.id));
             }
             Err(error) => self.status = format!("Remove clip failed: {error}"),
         }
@@ -926,10 +969,9 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::remove_clip(&path, &clip_id) {
             Ok(clip) => {
-                self.status = format!("Removed clip {}", clip.id);
                 self.selected_clip_id = None;
                 self.edit_clip_id.clear();
-                self.reload_project();
+                self.refresh_project_after_edit(format!("Removed clip {}", clip.id));
             }
             Err(error) => self.status = format!("Remove clip failed: {error}"),
         }
@@ -939,14 +981,13 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::remove_track(&path, track_id) {
             Ok(track) => {
-                self.status = format!("Removed track '{}'", track.name);
                 if self.recording_track_id == track.id.to_string() {
                     self.recording_track_id.clear();
                 }
                 self.selected_clip_id = None;
                 self.edit_clip_id.clear();
                 self.track_name_edits.remove(&track.id.to_string());
-                self.reload_project();
+                self.refresh_project_after_edit(format!("Removed track '{}'", track.name));
             }
             Err(error) => self.status = format!("Remove track failed: {error}"),
         }
@@ -1020,6 +1061,7 @@ fn render_arrangement(
     playhead_sample: &str,
     live_recording: Option<&LiveRecordingPreview>,
     timeline_zoom: f32,
+    snap_grid_samples: Option<u64>,
     selected_clip_id: Option<&daw_model::StableId>,
     active_clip_drag: Option<&ActiveClipDrag>,
     recording_track_id: &str,
@@ -1040,8 +1082,13 @@ fn render_arrangement(
             let timeline_width = ((available_width - TRACK_HEADER_WIDTH).max(640.0)
                 * timeline_zoom.max(0.1))
             .max(640.0);
-            if let Some(sample) = render_time_ruler(ui, timeline_width, timeline_samples, playhead)
-            {
+            if let Some(sample) = render_time_ruler(
+                ui,
+                timeline_width,
+                timeline_samples,
+                playhead,
+                snap_grid_samples,
+            ) {
                 actions.push(ArrangementAction::SetPlayhead(sample));
             }
 
@@ -1055,6 +1102,7 @@ fn render_arrangement(
                     timeline_samples,
                     timeline_width,
                     playhead,
+                    snap_grid_samples,
                     live_recording,
                     selected_clip_id,
                     active_clip_drag,
@@ -1090,6 +1138,7 @@ fn render_time_ruler(
     timeline_width: f32,
     timeline_samples: u64,
     playhead: u64,
+    snap_grid_samples: Option<u64>,
 ) -> Option<u64> {
     let desired = egui::vec2(TRACK_HEADER_WIDTH + timeline_width, 34.0);
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
@@ -1099,6 +1148,7 @@ fn render_time_ruler(
         rect.right_bottom(),
     );
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(28, 30, 34));
+    draw_snap_grid(&painter, timeline_rect, timeline_samples, snap_grid_samples);
     painter.line_segment(
         [timeline_rect.left_bottom(), timeline_rect.right_bottom()],
         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(64, 68, 76)),
@@ -1132,7 +1182,12 @@ fn render_time_ruler(
         .filter(|_| {
             response.clicked() || response.dragged() || response.is_pointer_button_down_on()
         })
-        .map(|position| sample_from_x(position.x, timeline_rect, timeline_samples))
+        .map(|position| {
+            snap_sample(
+                sample_from_x(position.x, timeline_rect, timeline_samples),
+                snap_grid_samples,
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1145,6 +1200,7 @@ fn render_track_lane(
     timeline_samples: u64,
     timeline_width: f32,
     playhead: u64,
+    snap_grid_samples: Option<u64>,
     live_recording: Option<&LiveRecordingPreview>,
     selected_clip_id: Option<&daw_model::StableId>,
     active_clip_drag: Option<&ActiveClipDrag>,
@@ -1177,6 +1233,7 @@ fn render_track_lane(
     }
 
     draw_lane_grid(&painter, lane_rect);
+    draw_snap_grid(&painter, lane_rect, timeline_samples, snap_grid_samples);
     draw_playhead(&painter, lane_rect, playhead, timeline_samples);
 
     let mut clip_rects = Vec::new();
@@ -1199,6 +1256,7 @@ fn render_track_lane(
             &track.id,
             clip,
             timeline_samples,
+            snap_grid_samples,
             selected_clip_id,
             active_clip_drag,
         );
@@ -1209,14 +1267,26 @@ fn render_track_lane(
     }
 
     if active_clip_drag.is_none() {
-        if let Some(sample) = lane_pointer_sample(ui, lane_rect, &clip_rects, timeline_samples) {
+        if let Some(sample) = lane_pointer_sample(
+            ui,
+            lane_rect,
+            &clip_rects,
+            timeline_samples,
+            snap_grid_samples,
+        ) {
             actions.push(ArrangementAction::SetPlayhead(sample));
         }
     }
 
     if let Some(drag) = active_clip_drag {
-        if let Some(action) = update_clip_drag_in_lane(ui, rect, lane_rect, track, timeline_samples)
-        {
+        if let Some(action) = update_clip_drag_in_lane(
+            ui,
+            rect,
+            lane_rect,
+            track,
+            timeline_samples,
+            snap_grid_samples,
+        ) {
             actions.push(action);
         }
         if drag.current_track_id == track.id {
@@ -1370,6 +1440,34 @@ fn draw_lane_grid(painter: &egui::Painter, rect: egui::Rect) {
 }
 
 #[allow(clippy::cast_precision_loss)]
+fn draw_snap_grid(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    timeline_samples: u64,
+    snap_grid_samples: Option<u64>,
+) {
+    let Some(mut step_samples) = snap_grid_samples.filter(|samples| *samples > 0) else {
+        return;
+    };
+    while timeline_samples / step_samples > 128 {
+        step_samples = step_samples.saturating_mul(2);
+    }
+    let mut sample = step_samples;
+    while sample < timeline_samples {
+        let fraction = sample as f32 / timeline_samples.max(1) as f32;
+        let x = egui::lerp(rect.left()..=rect.right(), fraction);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 46, 54)),
+        );
+        sample = sample.saturating_add(step_samples);
+        if sample == u64::MAX {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
 fn draw_playhead(painter: &egui::Painter, rect: egui::Rect, playhead: u64, timeline_samples: u64) {
     let fraction = (playhead as f32 / timeline_samples.max(1) as f32).clamp(0.0, 1.0);
     let x = egui::lerp(rect.left()..=rect.right(), fraction);
@@ -1384,6 +1482,7 @@ fn lane_pointer_sample(
     lane_rect: egui::Rect,
     clip_rects: &[egui::Rect],
     timeline_samples: u64,
+    snap_grid_samples: Option<u64>,
 ) -> Option<u64> {
     let pointer = ui.input(|input| input.pointer.clone());
     if !pointer.primary_down() {
@@ -1393,7 +1492,10 @@ fn lane_pointer_sample(
     if !lane_rect.contains(position) || clip_rects.iter().any(|rect| rect.contains(position)) {
         return None;
     }
-    Some(sample_from_x(position.x, lane_rect, timeline_samples))
+    Some(snap_sample(
+        sample_from_x(position.x, lane_rect, timeline_samples),
+        snap_grid_samples,
+    ))
 }
 
 fn update_clip_drag_in_lane(
@@ -1402,6 +1504,7 @@ fn update_clip_drag_in_lane(
     lane_rect: egui::Rect,
     track: &daw_model::Track,
     timeline_samples: u64,
+    snap_grid_samples: Option<u64>,
 ) -> Option<ArrangementAction> {
     let pointer = ui.input(|input| input.pointer.clone());
     if !pointer.primary_down() {
@@ -1416,6 +1519,7 @@ fn update_clip_drag_in_lane(
         pointer_x: position.x,
         lane_width: lane_rect.width(),
         timeline_samples,
+        snap_grid_samples,
     })
 }
 
@@ -1543,6 +1647,7 @@ fn render_clip(
     track_id: &daw_model::StableId,
     clip: &daw_model::Clip,
     timeline_samples: u64,
+    snap_grid_samples: Option<u64>,
     selected_clip_id: Option<&daw_model::StableId>,
     active_clip_drag: Option<&ActiveClipDrag>,
 ) -> ClipRenderResult {
@@ -1593,6 +1698,7 @@ fn render_clip(
                         pointer_x: position.x,
                         lane_width: lane_rect.width(),
                         timeline_samples,
+                        snap_grid_samples,
                     }),
                 };
             }
@@ -1765,6 +1871,23 @@ fn apply_sample_delta(sample: u64, delta: i64) -> u64 {
         sample.saturating_add(delta.unsigned_abs())
     } else {
         sample.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+fn snap_grid_samples_from_ms(milliseconds: u32) -> u64 {
+    (u64::from(milliseconds) * u64::from(daw_engine::DEFAULT_SAMPLE_RATE)) / 1_000
+}
+
+fn snap_sample(sample: u64, grid_samples: Option<u64>) -> u64 {
+    let Some(grid_samples) = grid_samples.filter(|samples| *samples > 0) else {
+        return sample;
+    };
+    let remainder = sample % grid_samples;
+    let lower = sample - remainder;
+    if remainder >= grid_samples - remainder {
+        lower.saturating_add(grid_samples)
+    } else {
+        lower
     }
 }
 
@@ -1991,4 +2114,24 @@ fn duration_to_frames(duration: f32, sample_rate: u32) -> Result<usize, String> 
         return Err("Duration must be greater than zero".to_owned());
     }
     Ok((f64::from(duration) * f64::from(sample_rate)).round() as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{snap_grid_samples_from_ms, snap_sample};
+
+    #[test]
+    fn converts_snap_grid_milliseconds_to_samples() {
+        assert_eq!(snap_grid_samples_from_ms(250), 12_000);
+        assert_eq!(snap_grid_samples_from_ms(1_000), 48_000);
+    }
+
+    #[test]
+    fn snaps_samples_to_nearest_grid_line() {
+        assert_eq!(snap_sample(11_999, Some(12_000)), 12_000);
+        assert_eq!(snap_sample(6_000, Some(12_000)), 12_000);
+        assert_eq!(snap_sample(5_999, Some(12_000)), 0);
+        assert_eq!(snap_sample(18_001, Some(12_000)), 24_000);
+        assert_eq!(snap_sample(18_001, None), 18_001);
+    }
 }

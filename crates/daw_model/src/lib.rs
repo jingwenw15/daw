@@ -1751,6 +1751,65 @@ mod tests {
     }
 
     #[test]
+    fn record_move_delete_reopen_flow_stays_replayable() {
+        let project_dir = temp_project_dir("record-edit-reopen");
+        init_project(&project_dir, "Record Edit Reopen").expect("init project");
+        let drums = add_track(&project_dir, "Drums").expect("add drums track");
+        let vocals = add_track(&project_dir, "Vocals").expect("add vocals track");
+        let first_recording = add_media_reference(
+            &project_dir,
+            "rec001",
+            Some("/tmp/recording-1.wav".to_owned()),
+        )
+        .expect("add first recording media");
+        let second_recording = add_media_reference(
+            &project_dir,
+            "rec002",
+            Some("/tmp/recording-2.wav".to_owned()),
+        )
+        .expect("add second recording media");
+        let scratch =
+            add_clip(&project_dir, &drums.id, &first_recording.id, 0, 24_000).expect("add scratch");
+        let keeper = add_clip(
+            &project_dir,
+            &drums.id,
+            &second_recording.id,
+            48_000,
+            48_000,
+        )
+        .expect("add keeper");
+
+        let moved_keeper =
+            set_clip_placement_on_track(&project_dir, &keeper.id, Some(&vocals.id), 12_000, 48_000)
+                .expect("move keeper to vocals");
+        remove_clip(&project_dir, &scratch.id).expect("remove scratch");
+        let after_clip_delete = load_project(&project_dir).expect("reload after clip delete");
+        let replayed_after_clip_delete =
+            replay_project(&project_dir).expect("replay after clip delete");
+
+        assert!(after_clip_delete.tracks[0].clips.is_empty());
+        assert_eq!(
+            after_clip_delete.tracks[1].clips,
+            vec![moved_keeper.clone()]
+        );
+        assert_eq!(after_clip_delete.media, vec![second_recording.clone()]);
+        assert_eq!(replayed_after_clip_delete, after_clip_delete);
+
+        remove_track(&project_dir, &drums.id).expect("remove empty drums track");
+        let after_track_delete = load_project(&project_dir).expect("reload after track delete");
+        let replayed_after_track_delete =
+            replay_project(&project_dir).expect("replay after track delete");
+
+        assert_eq!(after_track_delete.tracks.len(), 1);
+        assert_eq!(after_track_delete.tracks[0].id, vocals.id);
+        assert_eq!(after_track_delete.tracks[0].clips, vec![moved_keeper]);
+        assert_eq!(after_track_delete.media, vec![second_recording]);
+        assert_eq!(replayed_after_track_delete, after_track_delete);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
     fn creates_and_switches_branches() {
         let project_dir = temp_project_dir("branches");
         init_project(&project_dir, "Branches").expect("init project");
