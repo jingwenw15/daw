@@ -353,3 +353,16 @@ cargo run --bin daw -- project tempo /tmp/my-session 96
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 30
+
+Timeline snapping can now use project tempo. The transport keeps the existing
+millisecond snap mode and adds a Beat mode with configurable beat subdivision.
+Beat mode derives samples-per-beat from project BPM, draws beat and stronger bar
+grid lines in the ruler and track lanes, and snaps playhead/clip edits to the
+nearest beat subdivision while keeping project storage sample-accurate.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

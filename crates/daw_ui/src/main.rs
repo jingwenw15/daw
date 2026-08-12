@@ -10,6 +10,8 @@ const TRACK_HEADER_WIDTH: f32 = 260.0;
 const TRACK_LANE_HEIGHT: f32 = 92.0;
 const MIN_TIMELINE_SAMPLES: u64 = 240_000;
 const DEFAULT_SNAP_GRID_MS: u32 = 250;
+const DEFAULT_BEAT_DIVISION: u16 = 1;
+const BEATS_PER_BAR: u64 = 4;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -41,7 +43,9 @@ struct DawApp {
     mixer_solo: bool,
     timeline_zoom: f32,
     snap_enabled: bool,
+    snap_mode: SnapMode,
     snap_grid_ms: u32,
+    snap_beat_division: u16,
     selected_clip_id: Option<daw_model::StableId>,
     clip_drag: Option<ActiveClipDrag>,
     track_name_edits: BTreeMap<String, String>,
@@ -70,6 +74,19 @@ struct ActiveRecording {
 struct ActivePlayback {
     transport: daw_engine::PlaybackTransport,
     start_sample: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapMode {
+    Time,
+    Beat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimelineGrid {
+    snap: Option<u64>,
+    beat: Option<u64>,
+    bar: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -161,7 +178,9 @@ impl Default for DawApp {
             mixer_solo: false,
             timeline_zoom: 1.0,
             snap_enabled: true,
+            snap_mode: SnapMode::Time,
             snap_grid_ms: DEFAULT_SNAP_GRID_MS,
+            snap_beat_division: DEFAULT_BEAT_DIVISION,
             selected_clip_id: None,
             clip_drag: None,
             track_name_edits: BTreeMap::new(),
@@ -191,6 +210,7 @@ impl eframe::App for DawApp {
 }
 
 impl DawApp {
+    #[allow(clippy::too_many_lines)]
     fn render_transport(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("transport").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -228,13 +248,37 @@ impl DawApp {
                     self.set_project_tempo();
                 }
                 ui.checkbox(&mut self.snap_enabled, "Snap");
-                ui.add_enabled(
-                    self.snap_enabled,
-                    egui::DragValue::new(&mut self.snap_grid_ms)
-                        .range(10..=2_000)
-                        .speed(10.0)
-                        .suffix(" ms"),
-                );
+                ui.add_enabled_ui(self.snap_enabled, |ui| {
+                    egui::ComboBox::from_id_salt("snap-mode")
+                        .selected_text(match self.snap_mode {
+                            SnapMode::Time => "Time",
+                            SnapMode::Beat => "Beat",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.snap_mode, SnapMode::Time, "Time");
+                            ui.selectable_value(&mut self.snap_mode, SnapMode::Beat, "Beat");
+                        });
+                    match self.snap_mode {
+                        SnapMode::Time => {
+                            ui.add(
+                                egui::DragValue::new(&mut self.snap_grid_ms)
+                                    .range(10..=2_000)
+                                    .speed(10.0)
+                                    .suffix(" ms"),
+                            );
+                        }
+                        SnapMode::Beat => {
+                            ui.label("Div");
+                            ui.add(
+                                egui::DragValue::new(&mut self.snap_beat_division)
+                                    .range(1..=16)
+                                    .speed(1.0)
+                                    .prefix("1/")
+                                    .suffix(" beat"),
+                            );
+                        }
+                    }
+                });
                 if ui
                     .add_enabled(self.playback.is_none(), egui::Button::new("Play"))
                     .clicked()
@@ -417,7 +461,7 @@ impl DawApp {
                     &self.playhead_sample,
                     live_recording.as_ref(),
                     self.timeline_zoom,
-                    self.snap_grid_samples(),
+                    self.timeline_grid(),
                     self.selected_clip_id.as_ref(),
                     self.clip_drag.as_ref(),
                     &self.recording_track_id,
@@ -433,10 +477,29 @@ impl DawApp {
         });
     }
 
-    fn snap_grid_samples(&self) -> Option<u64> {
-        self.snap_enabled
-            .then(|| snap_grid_samples_from_ms(self.snap_grid_ms))
-            .filter(|samples| *samples > 0)
+    fn timeline_grid(&self) -> TimelineGrid {
+        if !self.snap_enabled {
+            return TimelineGrid {
+                snap: None,
+                beat: None,
+                bar: None,
+            };
+        }
+        match self.snap_mode {
+            SnapMode::Time => TimelineGrid {
+                snap: Some(snap_grid_samples_from_ms(self.snap_grid_ms)),
+                beat: None,
+                bar: None,
+            },
+            SnapMode::Beat => {
+                let beat_samples = samples_per_beat(self.project_tempo_bpm);
+                TimelineGrid {
+                    snap: Some(beat_samples / u64::from(self.snap_beat_division).max(1)),
+                    beat: Some(beat_samples),
+                    bar: Some(beat_samples.saturating_mul(BEATS_PER_BAR)),
+                }
+            }
+        }
     }
 
     fn create_project(&mut self) {
@@ -1091,7 +1154,7 @@ fn render_arrangement(
     playhead_sample: &str,
     live_recording: Option<&LiveRecordingPreview>,
     timeline_zoom: f32,
-    snap_grid_samples: Option<u64>,
+    timeline_grid: TimelineGrid,
     selected_clip_id: Option<&daw_model::StableId>,
     active_clip_drag: Option<&ActiveClipDrag>,
     recording_track_id: &str,
@@ -1117,7 +1180,7 @@ fn render_arrangement(
                 timeline_width,
                 timeline_samples,
                 playhead,
-                snap_grid_samples,
+                timeline_grid,
             ) {
                 actions.push(ArrangementAction::SetPlayhead(sample));
             }
@@ -1132,7 +1195,7 @@ fn render_arrangement(
                     timeline_samples,
                     timeline_width,
                     playhead,
-                    snap_grid_samples,
+                    timeline_grid,
                     live_recording,
                     selected_clip_id,
                     active_clip_drag,
@@ -1168,7 +1231,7 @@ fn render_time_ruler(
     timeline_width: f32,
     timeline_samples: u64,
     playhead: u64,
-    snap_grid_samples: Option<u64>,
+    timeline_grid: TimelineGrid,
 ) -> Option<u64> {
     let desired = egui::vec2(TRACK_HEADER_WIDTH + timeline_width, 34.0);
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
@@ -1178,7 +1241,7 @@ fn render_time_ruler(
         rect.right_bottom(),
     );
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(28, 30, 34));
-    draw_snap_grid(&painter, timeline_rect, timeline_samples, snap_grid_samples);
+    draw_snap_grid(&painter, timeline_rect, timeline_samples, timeline_grid);
     painter.line_segment(
         [timeline_rect.left_bottom(), timeline_rect.right_bottom()],
         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(64, 68, 76)),
@@ -1215,7 +1278,7 @@ fn render_time_ruler(
         .map(|position| {
             snap_sample(
                 sample_from_x(position.x, timeline_rect, timeline_samples),
-                snap_grid_samples,
+                timeline_grid.snap,
             )
         })
 }
@@ -1230,7 +1293,7 @@ fn render_track_lane(
     timeline_samples: u64,
     timeline_width: f32,
     playhead: u64,
-    snap_grid_samples: Option<u64>,
+    timeline_grid: TimelineGrid,
     live_recording: Option<&LiveRecordingPreview>,
     selected_clip_id: Option<&daw_model::StableId>,
     active_clip_drag: Option<&ActiveClipDrag>,
@@ -1263,7 +1326,7 @@ fn render_track_lane(
     }
 
     draw_lane_grid(&painter, lane_rect);
-    draw_snap_grid(&painter, lane_rect, timeline_samples, snap_grid_samples);
+    draw_snap_grid(&painter, lane_rect, timeline_samples, timeline_grid);
     draw_playhead(&painter, lane_rect, playhead, timeline_samples);
 
     let mut clip_rects = Vec::new();
@@ -1286,7 +1349,7 @@ fn render_track_lane(
             &track.id,
             clip,
             timeline_samples,
-            snap_grid_samples,
+            timeline_grid.snap,
             selected_clip_id,
             active_clip_drag,
         );
@@ -1302,7 +1365,7 @@ fn render_track_lane(
             lane_rect,
             &clip_rects,
             timeline_samples,
-            snap_grid_samples,
+            timeline_grid.snap,
         ) {
             actions.push(ArrangementAction::SetPlayhead(sample));
         }
@@ -1315,7 +1378,7 @@ fn render_track_lane(
             lane_rect,
             track,
             timeline_samples,
-            snap_grid_samples,
+            timeline_grid.snap,
         ) {
             actions.push(action);
         }
@@ -1474,11 +1537,49 @@ fn draw_snap_grid(
     painter: &egui::Painter,
     rect: egui::Rect,
     timeline_samples: u64,
-    snap_grid_samples: Option<u64>,
+    timeline_grid: TimelineGrid,
 ) {
-    let Some(mut step_samples) = snap_grid_samples.filter(|samples| *samples > 0) else {
+    if let Some(beat_samples) = timeline_grid.beat {
+        draw_grid_lines(
+            painter,
+            rect,
+            timeline_samples,
+            beat_samples,
+            egui::Color32::from_rgb(48, 53, 63),
+        );
+        if let Some(bar_samples) = timeline_grid.bar {
+            draw_grid_lines(
+                painter,
+                rect,
+                timeline_samples,
+                bar_samples,
+                egui::Color32::from_rgb(60, 66, 78),
+            );
+        }
         return;
-    };
+    }
+    if let Some(snap_samples) = timeline_grid.snap {
+        draw_grid_lines(
+            painter,
+            rect,
+            timeline_samples,
+            snap_samples,
+            egui::Color32::from_rgb(42, 46, 54),
+        );
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn draw_grid_lines(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    timeline_samples: u64,
+    mut step_samples: u64,
+    color: egui::Color32,
+) {
+    if step_samples == 0 {
+        return;
+    }
     while timeline_samples / step_samples > 128 {
         step_samples = step_samples.saturating_mul(2);
     }
@@ -1488,7 +1589,7 @@ fn draw_snap_grid(
         let x = egui::lerp(rect.left()..=rect.right(), fraction);
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 46, 54)),
+            egui::Stroke::new(1.0_f32, color),
         );
         sample = sample.saturating_add(step_samples);
         if sample == u64::MAX {
@@ -1908,6 +2009,12 @@ fn snap_grid_samples_from_ms(milliseconds: u32) -> u64 {
     (u64::from(milliseconds) * u64::from(daw_engine::DEFAULT_SAMPLE_RATE)) / 1_000
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn samples_per_beat(tempo_bpm: u16) -> u64 {
+    ((f64::from(daw_engine::DEFAULT_SAMPLE_RATE) * 60.0) / f64::from(tempo_bpm.max(1))).round()
+        as u64
+}
+
 fn snap_sample(sample: u64, grid_samples: Option<u64>) -> u64 {
     let Some(grid_samples) = grid_samples.filter(|samples| *samples > 0) else {
         return sample;
@@ -2148,12 +2255,19 @@ fn duration_to_frames(duration: f32, sample_rate: u32) -> Result<usize, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{snap_grid_samples_from_ms, snap_sample};
+    use super::{samples_per_beat, snap_grid_samples_from_ms, snap_sample};
 
     #[test]
     fn converts_snap_grid_milliseconds_to_samples() {
         assert_eq!(snap_grid_samples_from_ms(250), 12_000);
         assert_eq!(snap_grid_samples_from_ms(1_000), 48_000);
+    }
+
+    #[test]
+    fn converts_tempo_to_beat_samples() {
+        assert_eq!(samples_per_beat(120), 24_000);
+        assert_eq!(samples_per_beat(96), 30_000);
+        assert_eq!(samples_per_beat(60), 48_000);
     }
 
     #[test]

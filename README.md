@@ -27,6 +27,7 @@ platform is macOS, with the architecture kept portable where practical.
 - Imported WAV media, waveform cache generation, and waveform drawing.
 - Clip selection, deletion, command-log-backed placement edits, and horizontal
   timeline dragging.
+- Time-based and tempo-derived beat-grid snapping in the arrangement.
 - Optional Git integration through system Git, including private remote support
   via the user's existing credentials.
 
