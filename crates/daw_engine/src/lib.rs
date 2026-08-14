@@ -93,7 +93,7 @@ pub struct PlaybackTransport {
     next_sample: Arc<AtomicUsize>,
     stream_errors: Arc<AtomicU32>,
     stop_requested: Arc<AtomicBool>,
-    total_samples: usize,
+    total_samples: Option<usize>,
 }
 
 /// Handle for an active real-time recording stream.
@@ -180,6 +180,68 @@ pub fn render_sine(
     })
 }
 
+/// Render a synthesized metronome click track.
+///
+/// The first beat of each bar is accented. Clicks are generated from short
+/// decaying sine bursts, so no bundled samples or copyrighted assets are used.
+///
+/// # Errors
+///
+/// Returns an error if tempo, meter, duration, or render settings are invalid.
+pub fn render_metronome(
+    tempo_bpm: u16,
+    beats_per_bar: u16,
+    bars: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<AudioBuffer, RenderError> {
+    validate_render_settings(1.0, sample_rate, channels)?;
+    if tempo_bpm == 0 {
+        return Err(RenderError::InvalidSettings(
+            "tempo must be greater than zero".to_owned(),
+        ));
+    }
+    if beats_per_bar == 0 {
+        return Err(RenderError::InvalidSettings(
+            "beats per bar must be greater than zero".to_owned(),
+        ));
+    }
+    if bars == 0 {
+        return Err(RenderError::InvalidSettings(
+            "bar count must be greater than zero".to_owned(),
+        ));
+    }
+
+    let beat_frames = samples_per_beat(tempo_bpm, sample_rate);
+    let beat_count = usize::from(beats_per_bar)
+        .checked_mul(
+            usize::try_from(bars)
+                .map_err(|_| RenderError::InvalidSettings("bar count is too large".to_owned()))?,
+        )
+        .ok_or_else(|| RenderError::InvalidSettings("metronome is too long".to_owned()))?;
+    let frames = beat_frames
+        .checked_mul(beat_count)
+        .ok_or_else(|| RenderError::InvalidSettings("metronome is too long".to_owned()))?;
+    let mut buffer = AudioBuffer {
+        sample_rate,
+        channels,
+        samples: vec![0.0; frames * usize::from(channels)],
+    };
+
+    for beat in 0..beat_count {
+        let frame = beat * beat_frames;
+        let accented = beat % usize::from(beats_per_bar) == 0;
+        let (frequency, gain) = if accented {
+            (1_760.0_f32, 0.70_f32)
+        } else {
+            (1_100.0_f32, 0.42_f32)
+        };
+        mix_decaying_sine_click(&mut buffer, frame, frequency, gain, 0.045);
+    }
+
+    Ok(buffer)
+}
+
 /// Play a short sine test tone through the default output device.
 ///
 /// # Errors
@@ -225,6 +287,28 @@ pub fn play_buffer(
 /// Returns an error if no output device exists, the stream cannot be built, or
 /// the stream cannot be started.
 pub fn start_buffer_playback(buffer: AudioBuffer) -> Result<PlaybackTransport, PlaybackError> {
+    start_buffer_playback_inner(buffer, false)
+}
+
+/// Start looping a rendered buffer through the default output device.
+///
+/// The returned transport owns the native audio stream. Dropping or stopping it
+/// ends playback.
+///
+/// # Errors
+///
+/// Returns an error if no output device exists, the stream cannot be built, or
+/// the stream cannot be started.
+pub fn start_looping_buffer_playback(
+    buffer: AudioBuffer,
+) -> Result<PlaybackTransport, PlaybackError> {
+    start_buffer_playback_inner(buffer, true)
+}
+
+fn start_buffer_playback_inner(
+    buffer: AudioBuffer,
+    looping: bool,
+) -> Result<PlaybackTransport, PlaybackError> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -251,6 +335,7 @@ pub fn start_buffer_playback(buffer: AudioBuffer) -> Result<PlaybackTransport, P
             Arc::clone(&buffer),
             Arc::clone(&next_sample),
             Arc::clone(&stop_requested),
+            looping,
             &stream_errors,
         ),
         cpal::SampleFormat::I16 => build_test_tone_stream::<i16>(
@@ -259,6 +344,7 @@ pub fn start_buffer_playback(buffer: AudioBuffer) -> Result<PlaybackTransport, P
             Arc::clone(&buffer),
             Arc::clone(&next_sample),
             Arc::clone(&stop_requested),
+            looping,
             &stream_errors,
         ),
         cpal::SampleFormat::U16 => build_test_tone_stream::<u16>(
@@ -267,6 +353,7 @@ pub fn start_buffer_playback(buffer: AudioBuffer) -> Result<PlaybackTransport, P
             Arc::clone(&buffer),
             Arc::clone(&next_sample),
             Arc::clone(&stop_requested),
+            looping,
             &stream_errors,
         ),
         format => Err(PlaybackError::BuildStream(format!(
@@ -286,7 +373,7 @@ pub fn start_buffer_playback(buffer: AudioBuffer) -> Result<PlaybackTransport, P
         next_sample,
         stream_errors,
         stop_requested,
-        total_samples,
+        total_samples: (!looping).then_some(total_samples),
     })
 }
 
@@ -610,7 +697,8 @@ impl PlaybackTransport {
     /// Return true once the stream has consumed the complete source buffer.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.next_sample.load(Ordering::Relaxed) >= self.total_samples
+        self.total_samples
+            .is_some_and(|total_samples| self.next_sample.load(Ordering::Relaxed) >= total_samples)
     }
 }
 
@@ -819,6 +907,37 @@ fn fill_sine_samples(
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn samples_per_beat(tempo_bpm: u16, sample_rate: u32) -> usize {
+    ((f64::from(sample_rate) * 60.0) / f64::from(tempo_bpm.max(1))).round() as usize
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn mix_decaying_sine_click(
+    buffer: &mut AudioBuffer,
+    start_frame: usize,
+    frequency_hz: f32,
+    gain: f32,
+    duration_seconds: f32,
+) {
+    let channels = usize::from(buffer.channels);
+    let click_frames = frames_for_duration(duration_seconds, buffer.sample_rate);
+    for offset in 0..click_frames {
+        let frame = start_frame + offset;
+        if frame >= buffer.frames() {
+            break;
+        }
+        let time = offset as f64 / f64::from(buffer.sample_rate);
+        let decay = (-time * 90.0).exp();
+        let sample = (time * f64::from(frequency_hz) * TAU).sin() * f64::from(gain) * decay;
+        for channel in 0..channels {
+            let index = frame * channels + channel;
+            buffer.samples[index] =
+                (buffer.samples[index] + sample_to_f32(sample)).clamp(-1.0, 1.0);
+        }
+    }
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn sample_to_f32(sample: f64) -> f32 {
     sample as f32
@@ -836,6 +955,7 @@ fn build_test_tone_stream<T>(
     buffer: Arc<AudioBuffer>,
     next_sample: Arc<AtomicUsize>,
     stop_requested: Arc<AtomicBool>,
+    looping: bool,
     stream_errors: &Arc<AtomicU32>,
 ) -> Result<cpal::Stream, PlaybackError>
 where
@@ -846,7 +966,7 @@ where
         .build_output_stream(
             config,
             move |output: &mut [T], _| {
-                write_playback_data(output, &buffer, &next_sample, &stop_requested);
+                write_playback_data(output, &buffer, &next_sample, &stop_requested, looping);
             },
             move |_| {
                 error_counter.fetch_add(1, Ordering::Relaxed);
@@ -922,15 +1042,19 @@ fn write_playback_data<T>(
     buffer: &AudioBuffer,
     next_sample: &AtomicUsize,
     stop_requested: &AtomicBool,
+    looping: bool,
 ) where
     T: Sample + FromSample<f32>,
 {
     for sample in output {
-        let index = if stop_requested.load(Ordering::Relaxed) {
+        let mut index = if stop_requested.load(Ordering::Relaxed) {
             buffer.samples.len()
         } else {
             next_sample.fetch_add(1, Ordering::Relaxed)
         };
+        if looping && !buffer.samples.is_empty() {
+            index %= buffer.samples.len();
+        }
         let value = buffer.samples.get(index).copied().unwrap_or(0.0);
         *sample = T::from_sample(value);
     }
@@ -1027,8 +1151,8 @@ fn parse_pcm16_wav(bytes: &[u8]) -> Result<AudioBuffer, RenderError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        convert_channels, mix_clip, read_wav, render_silence, render_sine, slice_frames, write_wav,
-        AudioBuffer, DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE,
+        convert_channels, mix_clip, read_wav, render_metronome, render_silence, render_sine,
+        slice_frames, write_wav, AudioBuffer, DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE,
     };
     use std::{fs, path::PathBuf};
 
@@ -1057,6 +1181,18 @@ mod tests {
 
         assert_eq!(buffer.frames(), 24_000);
         assert!(buffer.samples.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn renders_metronome_with_bar_accents() {
+        let buffer =
+            render_metronome(120, 4, 2, DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS).expect("metronome");
+
+        assert_eq!(buffer.frames(), 192_000);
+        assert!(buffer.samples.iter().any(|sample| sample.abs() > 0.0));
+        let accent_peak = peak_between(&buffer, 0, 2_000);
+        let regular_peak = peak_between(&buffer, 24_000, 26_000);
+        assert!(accent_peak > regular_peak);
     }
 
     #[test]
@@ -1125,5 +1261,15 @@ mod tests {
 
     fn temp_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("daw-engine-{}-{name}", std::process::id()))
+    }
+
+    fn peak_between(buffer: &AudioBuffer, start_frame: usize, end_frame: usize) -> f32 {
+        let channels = usize::from(buffer.channels);
+        let start = start_frame * channels;
+        let end = (end_frame * channels).min(buffer.samples.len());
+        buffer.samples[start..end]
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0, f32::max)
     }
 }

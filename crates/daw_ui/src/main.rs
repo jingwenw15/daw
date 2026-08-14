@@ -21,6 +21,7 @@ fn main() -> eframe::Result {
     eframe::run_native("DAW", options, Box::new(|_| Ok(Box::<DawApp>::default())))
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct DawApp {
     project_path: String,
     new_project_name: String,
@@ -42,6 +43,7 @@ struct DawApp {
     mixer_muted: bool,
     mixer_solo: bool,
     timeline_zoom: f32,
+    metronome_enabled: bool,
     snap_enabled: bool,
     snap_mode: SnapMode,
     snap_grid_ms: u32,
@@ -67,6 +69,7 @@ struct RecordingInsertReport {
 
 struct ActiveRecording {
     transport: daw_engine::RecordingTransport,
+    metronome: Option<daw_engine::PlaybackTransport>,
     track_id: daw_model::StableId,
     start_sample: u64,
 }
@@ -177,6 +180,7 @@ impl Default for DawApp {
             mixer_muted: false,
             mixer_solo: false,
             timeline_zoom: 1.0,
+            metronome_enabled: false,
             snap_enabled: true,
             snap_mode: SnapMode::Time,
             snap_grid_ms: DEFAULT_SNAP_GRID_MS,
@@ -247,6 +251,7 @@ impl DawApp {
                 if ui.button("Set Tempo").clicked() {
                     self.set_project_tempo();
                 }
+                ui.checkbox(&mut self.metronome_enabled, "Metronome");
                 ui.checkbox(&mut self.snap_enabled, "Snap");
                 ui.add_enabled_ui(self.snap_enabled, |ui| {
                     egui::ComboBox::from_id_salt("snap-mode")
@@ -742,9 +747,30 @@ impl DawApp {
         }
         match daw_engine::start_input_recording() {
             Ok(transport) => {
-                self.status = format!("Recording from '{}'", transport.report().device_name);
+                let metronome = if self.metronome_enabled {
+                    match self.start_recording_metronome() {
+                        Ok(metronome) => Some(metronome),
+                        Err(error) => {
+                            self.status = format!("Metronome unavailable: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let metronome_status = if metronome.is_some() {
+                    " with metronome"
+                } else {
+                    ""
+                };
+                self.status = format!(
+                    "Recording from '{}'{}",
+                    transport.report().device_name,
+                    metronome_status
+                );
                 self.recording = Some(ActiveRecording {
                     transport,
+                    metronome,
                     track_id: daw_model::StableId::from_string(self.recording_track_id.clone()),
                     start_sample,
                 });
@@ -758,6 +784,9 @@ impl DawApp {
             "Nothing is recording".clone_into(&mut self.status);
             return;
         };
+        if let Some(mut metronome) = recording.metronome.take() {
+            let _ = metronome.stop();
+        }
         match recording.transport.stop() {
             Ok(recorded) => match insert_recorded_audio(
                 Path::new(&self.project_path),
@@ -793,6 +822,19 @@ impl DawApp {
             duration_samples,
             peaks: waveform_peaks_from_buffer(&recorded.buffer, daw_media::DEFAULT_WAVEFORM_POINTS),
         })
+    }
+
+    fn start_recording_metronome(&self) -> Result<daw_engine::PlaybackTransport, String> {
+        let buffer = daw_engine::render_metronome(
+            self.project_tempo_bpm,
+            u16::try_from(BEATS_PER_BAR).unwrap_or(4),
+            1,
+            daw_engine::DEFAULT_SAMPLE_RATE,
+            daw_engine::DEFAULT_CHANNELS,
+        )
+        .map_err(|error| format!("Metronome render failed: {error}"))?;
+        daw_engine::start_looping_buffer_playback(buffer)
+            .map_err(|error| format!("Metronome playback failed: {error}"))
     }
 
     fn commit_clip_move(&mut self, request: &ClipMoveRequest) {
@@ -1099,12 +1141,23 @@ impl DawApp {
                 return;
             }
         };
-        match render_project_buffer(&path, 1.0, start_sample).and_then(|buffer| {
-            daw_engine::start_buffer_playback(buffer)
-                .map_err(|error| format!("Playback failed: {error}"))
-        }) {
+        match render_project_buffer(&path, 1.0, start_sample, self.metronome_enabled).and_then(
+            |buffer| {
+                daw_engine::start_buffer_playback(buffer)
+                    .map_err(|error| format!("Playback failed: {error}"))
+            },
+        ) {
             Ok(transport) => {
-                self.status = format!("Playing on '{}'", transport.report().device_name);
+                let metronome_status = if self.metronome_enabled {
+                    " with metronome"
+                } else {
+                    ""
+                };
+                self.status = format!(
+                    "Playing on '{}'{}",
+                    transport.report().device_name,
+                    metronome_status
+                );
                 self.playback = Some(ActivePlayback {
                     transport,
                     start_sample,
@@ -2075,6 +2128,7 @@ fn render_project_buffer(
     project_path: &Path,
     minimum_duration: f32,
     start_sample: u64,
+    include_metronome: bool,
 ) -> Result<daw_engine::AudioBuffer, String> {
     let project = daw_model::load_project(project_path)
         .map_err(|error| format!("Project is invalid: {error}"))?;
@@ -2120,7 +2174,36 @@ fn render_project_buffer(
         }
     }
 
+    if include_metronome {
+        mix_metronome_into_buffer(&mut output, project.tempo_bpm)?;
+    }
+
     Ok(output)
+}
+
+fn mix_metronome_into_buffer(
+    output: &mut daw_engine::AudioBuffer,
+    tempo_bpm: u16,
+) -> Result<(), String> {
+    let frames = output.frames();
+    if frames == 0 {
+        return Ok(());
+    }
+    let bar_frames = samples_per_beat(tempo_bpm).saturating_mul(BEATS_PER_BAR);
+    let bars = frames
+        .div_ceil(usize::try_from(bar_frames.max(1)).unwrap_or(usize::MAX))
+        .max(1);
+    let bars = u32::try_from(bars).map_err(|_| "Metronome render is too long".to_owned())?;
+    let metronome = daw_engine::render_metronome(
+        tempo_bpm,
+        u16::try_from(BEATS_PER_BAR).unwrap_or(4),
+        bars,
+        output.sample_rate,
+        output.channels,
+    )
+    .map_err(|error| format!("Metronome render failed: {error}"))?;
+    daw_engine::mix_clip(output, &metronome, 0, 100, false);
+    Ok(())
 }
 
 fn mix_clip_from_project(
@@ -2255,7 +2338,9 @@ fn duration_to_frames(duration: f32, sample_rate: u32) -> Result<usize, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{samples_per_beat, snap_grid_samples_from_ms, snap_sample};
+    use super::{
+        mix_metronome_into_buffer, samples_per_beat, snap_grid_samples_from_ms, snap_sample,
+    };
 
     #[test]
     fn converts_snap_grid_milliseconds_to_samples() {
@@ -2277,5 +2362,18 @@ mod tests {
         assert_eq!(snap_sample(5_999, Some(12_000)), 0);
         assert_eq!(snap_sample(18_001, Some(12_000)), 24_000);
         assert_eq!(snap_sample(18_001, None), 18_001);
+    }
+
+    #[test]
+    fn mixes_metronome_into_existing_buffer() {
+        let mut buffer = daw_engine::AudioBuffer {
+            sample_rate: daw_engine::DEFAULT_SAMPLE_RATE,
+            channels: daw_engine::DEFAULT_CHANNELS,
+            samples: vec![0.0; 48_000 * usize::from(daw_engine::DEFAULT_CHANNELS)],
+        };
+
+        mix_metronome_into_buffer(&mut buffer, 120).expect("mix metronome");
+
+        assert!(buffer.samples.iter().any(|sample| sample.abs() > 0.0));
     }
 }

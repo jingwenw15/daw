@@ -366,3 +366,28 @@ nearest beat subdivision while keeping project storage sample-accurate.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 31
+
+The engine can synthesize a metronome click track without bundled samples. Bar
+starts use a higher accented decaying sine click, other beats use a lower click,
+and the CLI can render or play the generated metronome for a given BPM, bar
+count, and beats-per-bar setting.
+
+```sh
+cargo run --bin daw -- render-metronome /tmp/metronome.wav 120 4 4
+cargo run --bin daw -- play-metronome 120 4 4
+cargo test
+```
+
+## Stage 32
+
+The native UI can use the generated metronome in transport workflows. A
+`Metronome` toggle mixes synthesized clicks into project playback renders, and
+recording starts a separate looping click playback transport so timing guidance
+is heard without writing the click into the recorded clip file.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

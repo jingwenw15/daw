@@ -63,8 +63,10 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some("vcs") => run_vcs(args),
         Some("media") => run_media(args),
         Some("render-test-tone") => run_render_test_tone(args),
+        Some("render-metronome") => run_render_metronome(args),
         Some("render-project") => run_render_project(args),
         Some("play-project") => run_play_project(args),
+        Some("play-metronome") => run_play_metronome(args),
         Some("play-test-tone") => run_play_test_tone(args),
         Some("record-snippet") => run_record_snippet(args),
         Some("history") => {
@@ -151,6 +153,29 @@ fn run_play_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), Stri
     Ok(())
 }
 
+fn run_play_metronome(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let tempo_bpm = required_u16(&mut args, "tempo-bpm")?;
+    let bars = optional_u32(args.next(), 4, "bars")?;
+    let beats_per_bar = optional_u16(args.next(), 4, "beats-per-bar")?;
+    no_extra_args(args)?;
+    let buffer = daw_engine::render_metronome(
+        tempo_bpm,
+        beats_per_bar,
+        bars,
+        daw_engine::DEFAULT_SAMPLE_RATE,
+        daw_engine::DEFAULT_CHANNELS,
+    )
+    .map_err(|error| format!("failed to render metronome: {error}"))?;
+    let hold_seconds = frames_to_seconds(buffer.frames(), buffer.sample_rate) + 0.10;
+    let report = daw_engine::play_buffer(buffer, hold_seconds)
+        .map_err(|error| format!("failed to play metronome: {error}"))?;
+    println!(
+        "played metronome: {tempo_bpm} BPM, {beats_per_bar}/4, {bars} bars on '{}'",
+        report.device_name
+    );
+    Ok(())
+}
+
 fn run_play_project(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let project_path = required_arg(&mut args, "path")?;
     let duration = optional_f32(args.next(), 1.0, "minimum-duration-seconds")?;
@@ -188,6 +213,26 @@ fn run_render_test_tone(mut args: impl Iterator<Item = String>) -> Result<(), St
         buffer.sample_rate,
         output
     );
+    Ok(())
+}
+
+fn run_render_metronome(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let output = required_arg(&mut args, "output")?;
+    let tempo_bpm = required_u16(&mut args, "tempo-bpm")?;
+    let bars = optional_u32(args.next(), 4, "bars")?;
+    let beats_per_bar = optional_u16(args.next(), 4, "beats-per-bar")?;
+    no_extra_args(args)?;
+    let buffer = daw_engine::render_metronome(
+        tempo_bpm,
+        beats_per_bar,
+        bars,
+        daw_engine::DEFAULT_SAMPLE_RATE,
+        daw_engine::DEFAULT_CHANNELS,
+    )
+    .map_err(|error| format!("failed to render metronome: {error}"))?;
+    daw_engine::write_wav(output.as_ref(), &buffer)
+        .map_err(|error| format!("failed to write metronome: {error}"))?;
+    println!("rendered metronome: {tempo_bpm} BPM, {beats_per_bar}/4, {bars} bars -> {output}");
     Ok(())
 }
 
@@ -780,8 +825,10 @@ fn print_help() {
     println!("  daw media waveform <path> <hash> [points]");
     println!("  daw media waveforms <path> [points]");
     println!("  daw render-test-tone <output> [duration-seconds]");
+    println!("  daw render-metronome <output> <tempo-bpm> [bars] [beats-per-bar]");
     println!("  daw render-project <path> <output> [duration-seconds] [start-sample]");
     println!("  daw play-test-tone [duration-seconds]");
+    println!("  daw play-metronome <tempo-bpm> [bars] [beats-per-bar]");
     println!("  daw play-project <path> [minimum-duration-seconds] [start-sample]");
     println!("  daw record-snippet <path> <track-id> [duration-seconds] [start-sample]");
     println!("  daw diff <path> <left-ref> <right-ref>");
@@ -808,6 +855,22 @@ fn optional_u64(value: Option<String>, default: u64, name: &str) -> Result<u64, 
     value.map_or(Ok(default), |value| {
         value
             .parse::<u64>()
+            .map_err(|error| format!("invalid {name}: {error}"))
+    })
+}
+
+fn optional_u32(value: Option<String>, default: u32, name: &str) -> Result<u32, String> {
+    value.map_or(Ok(default), |value| {
+        value
+            .parse::<u32>()
+            .map_err(|error| format!("invalid {name}: {error}"))
+    })
+}
+
+fn optional_u16(value: Option<String>, default: u16, name: &str) -> Result<u16, String> {
+    value.map_or(Ok(default), |value| {
+        value
+            .parse::<u16>()
             .map_err(|error| format!("invalid {name}: {error}"))
     })
 }

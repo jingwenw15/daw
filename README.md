@@ -24,6 +24,8 @@ platform is macOS, with the architecture kept portable where practical.
 - Audio recording from the default input device.
 - Timeline playback from a movable playhead.
 - Command-log-backed project tempo.
+- Generated metronome click rendering and playback.
+- Native UI metronome during playback and recording.
 - Imported WAV media, waveform cache generation, and waveform drawing.
 - Clip selection, deletion, command-log-backed placement edits, and horizontal
   timeline dragging.
