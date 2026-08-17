@@ -395,6 +395,23 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("split") => {
+            let project = required_arg(&mut args, "path")?;
+            let clip_id = required_arg(&mut args, "clip-id")?;
+            let split_sample = required_u64(&mut args, "split-sample")?;
+            no_extra_args(args)?;
+            let (left, right) = daw_model::split_clip(
+                project.as_ref(),
+                &daw_model::StableId::from_string(clip_id),
+                split_sample,
+            )
+            .map_err(|error| format!("failed to split clip: {error}"))?;
+            println!(
+                "split clip into {} ({} samples) and {} ({} samples)",
+                left.id, left.duration_samples, right.id, right.duration_samples
+            );
+            Ok(())
+        }
         Some("remove") => {
             let project = required_arg(&mut args, "path")?;
             let clip_id = required_arg(&mut args, "clip-id")?;
@@ -756,11 +773,13 @@ fn render_project_buffer(
             }
             let decoded = daw_engine::convert_channels(&decoded, output.channels);
             let source_start = if start_sample > clip.start_sample {
-                usize::try_from(start_sample - clip.start_sample)
-                    .map_err(|_| "clip source start is too large".to_owned())?
+                clip.source_start_sample
+                    .saturating_add(start_sample - clip.start_sample)
             } else {
-                0
+                clip.source_start_sample
             };
+            let source_start = usize::try_from(source_start)
+                .map_err(|_| "clip source start is too large".to_owned())?;
             let destination_start = if clip.start_sample >= start_sample {
                 usize::try_from(clip.start_sample - start_sample)
                     .map_err(|_| "clip start is too large".to_owned())?
@@ -806,6 +825,7 @@ fn print_help() {
     println!("  daw track controls <path> <track-id> <volume-percent> <muted> <solo>");
     println!("  daw clip add <path> <track-id> <media-id> <start-sample> <duration-samples>");
     println!("  daw clip move <path> <clip-id> <start-sample> <duration-samples>");
+    println!("  daw clip split <path> <clip-id> <split-sample>");
     println!("  daw clip remove <path> <clip-id>");
     println!("  daw snapshot create <path> [message]");
     println!("  daw branch create <path> <name>");

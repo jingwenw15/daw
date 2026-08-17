@@ -404,3 +404,16 @@ any input stream is opened.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 34
+
+Timeline clips can be edited with trim handles and split at the playhead. The
+project model stores a clip source offset so left-edge trims and split clips
+play the correct region of the original media, and these edits are replayable
+through the command log. The CLI exposes the same split operation.
+
+```sh
+cargo run --bin daw -- clip split /tmp/my-session <clip-id> <split-sample>
+cargo test
+cargo run --bin daw-ui
+```

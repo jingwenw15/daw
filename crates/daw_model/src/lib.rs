@@ -85,6 +85,9 @@ pub struct Clip {
     pub media_id: StableId,
     /// Timeline start in samples.
     pub start_sample: u64,
+    /// Source media start offset in samples.
+    #[serde(default)]
+    pub source_start_sample: u64,
     /// Clip duration in samples.
     pub duration_samples: u64,
 }
@@ -152,8 +155,21 @@ pub enum ProjectCommand {
         track_id: Option<StableId>,
         /// Timeline start in samples.
         start_sample: u64,
+        /// Optional source media start offset in samples. Older command-log
+        /// entries omit this and preserve the clip source offset.
+        #[serde(default)]
+        source_start_sample: Option<u64>,
         /// Clip duration in samples.
         duration_samples: u64,
+    },
+    /// Split an existing clip into two timeline clips at a sample position.
+    SplitClip {
+        /// Clip to split. The existing clip becomes the left side.
+        clip_id: StableId,
+        /// Timeline sample where the split occurs.
+        split_sample: u64,
+        /// Stable ID assigned to the new right-side clip.
+        new_clip_id: StableId,
     },
     /// Remove an existing clip from its track.
     RemoveClip {
@@ -427,18 +443,27 @@ impl ProjectCommand {
                 clip_id,
                 track_id,
                 start_sample,
+                source_start_sample,
                 duration_samples,
             } => {
+                let source = source_start_sample
+                    .map(|source_start_sample| format!(" source={source_start_sample}"))
+                    .unwrap_or_default();
                 if let Some(track_id) = track_id {
                     format!(
-                        "set clip {clip_id} placement track={track_id} start={start_sample} duration={duration_samples}"
+                        "set clip {clip_id} placement track={track_id} start={start_sample}{source} duration={duration_samples}"
                     )
                 } else {
                     format!(
-                        "set clip {clip_id} placement start={start_sample} duration={duration_samples}"
+                        "set clip {clip_id} placement start={start_sample}{source} duration={duration_samples}"
                     )
                 }
             }
+            Self::SplitClip {
+                clip_id,
+                split_sample,
+                new_clip_id,
+            } => format!("split clip {clip_id} at {split_sample} into {new_clip_id}"),
             Self::RemoveClip { clip_id } => format!("remove clip {clip_id}"),
             Self::SetTrackControls {
                 track_id,
@@ -778,6 +803,7 @@ pub fn add_clip(
         id: StableId::new(),
         media_id: media_id.clone(),
         start_sample,
+        source_start_sample: 0,
         duration_samples,
     };
     append_and_apply(
@@ -818,12 +844,37 @@ pub fn set_clip_placement_on_track(
     start_sample: u64,
     duration_samples: u64,
 ) -> Result<Clip, ProjectIoError> {
+    set_clip_timing_on_track(
+        project_dir,
+        clip_id,
+        track_id,
+        start_sample,
+        None,
+        duration_samples,
+    )
+}
+
+/// Move, trim, or resize an existing clip, optionally moving it to another track.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the clip or target track is
+/// unknown, the timing is invalid, or the updated project cannot be saved.
+pub fn set_clip_timing_on_track(
+    project_dir: &Path,
+    clip_id: &StableId,
+    track_id: Option<&StableId>,
+    start_sample: u64,
+    source_start_sample: Option<u64>,
+    duration_samples: u64,
+) -> Result<Clip, ProjectIoError> {
     append_and_apply(
         project_dir,
         ProjectCommand::SetClipPlacement {
             clip_id: clip_id.clone(),
             track_id: track_id.cloned(),
             start_sample,
+            source_start_sample,
             duration_samples,
         },
     )?;
@@ -833,6 +884,36 @@ pub fn set_clip_placement_on_track(
             "unknown clip id {clip_id}"
         ))])
     })
+}
+
+/// Split an existing clip at a timeline sample.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the clip is unknown, the
+/// split point is outside the clip interior, or the updated project cannot be saved.
+pub fn split_clip(
+    project_dir: &Path,
+    clip_id: &StableId,
+    split_sample: u64,
+) -> Result<(Clip, Clip), ProjectIoError> {
+    let new_clip_id = StableId::new();
+    append_and_apply(
+        project_dir,
+        ProjectCommand::SplitClip {
+            clip_id: clip_id.clone(),
+            split_sample,
+            new_clip_id: new_clip_id.clone(),
+        },
+    )?;
+    let project = load_project(project_dir)?;
+    let left = find_clip(&project, clip_id)
+        .cloned()
+        .ok_or_else(|| unknown_clip_error(clip_id))?;
+    let right = find_clip(&project, &new_clip_id)
+        .cloned()
+        .ok_or_else(|| unknown_clip_error(&new_clip_id))?;
+    Ok((left, right))
 }
 
 /// Remove an existing clip.
@@ -1131,14 +1212,21 @@ fn apply_command(
             clip_id,
             track_id,
             start_sample,
+            source_start_sample,
             duration_samples,
         } => apply_set_clip_placement(
             project,
             clip_id,
             track_id.as_ref(),
             *start_sample,
+            *source_start_sample,
             *duration_samples,
         ),
+        ProjectCommand::SplitClip {
+            clip_id,
+            split_sample,
+            new_clip_id,
+        } => apply_split_clip(project, clip_id, *split_sample, new_clip_id),
         ProjectCommand::RemoveClip { clip_id } => apply_remove_clip(project, clip_id),
         ProjectCommand::SetTrackControls {
             track_id,
@@ -1177,6 +1265,7 @@ fn apply_set_clip_placement(
     clip_id: &StableId,
     track_id: Option<&StableId>,
     start_sample: u64,
+    source_start_sample: Option<u64>,
     duration_samples: u64,
 ) -> Result<Project, ProjectIoError> {
     let clip = if let Some(track_id) = track_id {
@@ -1185,7 +1274,48 @@ fn apply_set_clip_placement(
         find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?
     };
     clip.start_sample = start_sample;
+    if let Some(source_start_sample) = source_start_sample {
+        clip.source_start_sample = source_start_sample;
+    }
     clip.duration_samples = duration_samples;
+    sort_track_clips(&mut project);
+    validate_project_state(project)
+}
+
+fn apply_split_clip(
+    mut project: Project,
+    clip_id: &StableId,
+    split_sample: u64,
+    new_clip_id: &StableId,
+) -> Result<Project, ProjectIoError> {
+    let track_index = project
+        .tracks
+        .iter()
+        .position(|track| track.clips.iter().any(|clip| clip.id == *clip_id))
+        .ok_or_else(|| unknown_clip_error(clip_id))?;
+    let clip_index = project.tracks[track_index]
+        .clips
+        .iter()
+        .position(|clip| clip.id == *clip_id)
+        .ok_or_else(|| unknown_clip_error(clip_id))?;
+    let clip = project.tracks[track_index].clips[clip_index].clone();
+    let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+    if split_sample <= clip.start_sample || split_sample >= clip_end {
+        return Err(ProjectIoError::Invalid(vec![ValidationError::new(
+            format!("split sample {split_sample} must be inside clip {clip_id}"),
+        )]));
+    }
+    let left_duration = split_sample - clip.start_sample;
+    let right_duration = clip_end - split_sample;
+    project.tracks[track_index].clips[clip_index].duration_samples = left_duration;
+    let right = Clip {
+        id: new_clip_id.clone(),
+        media_id: clip.media_id,
+        start_sample: split_sample,
+        source_start_sample: clip.source_start_sample.saturating_add(left_duration),
+        duration_samples: right_duration,
+    };
+    project.tracks[track_index].clips.push(right);
     sort_track_clips(&mut project);
     validate_project_state(project)
 }
@@ -1491,9 +1621,9 @@ mod tests {
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
         project_file_path, remove_clip, remove_track, replay_project, set_clip_placement,
-        set_clip_placement_on_track, set_project_tempo, set_track_controls, set_track_name,
-        switch_branch, Project, ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM,
-        PROJECT_SCHEMA_VERSION,
+        set_clip_placement_on_track, set_clip_timing_on_track, set_project_tempo,
+        set_track_controls, set_track_name, split_clip, switch_branch, Project, ProjectIoError,
+        StableId, Track, DEFAULT_TEMPO_BPM, PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1724,10 +1854,60 @@ mod tests {
         let replayed = replay_project(&project_dir).expect("replay project");
 
         assert_eq!(edited.start_sample, 12_000);
+        assert_eq!(edited.source_start_sample, 0);
         assert_eq!(edited.duration_samples, 36_000);
         assert_eq!(removed, first_clip);
         assert_eq!(project.tracks[0].clips, vec![edited]);
         assert_eq!(project.media, vec![media]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn trims_clip_source_start_through_command_log() {
+        let project_dir = temp_project_dir("clip-trim");
+        init_project(&project_dir, "Clip Trim").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+
+        let trimmed =
+            set_clip_timing_on_track(&project_dir, &clip.id, None, 60_000, Some(12_000), 12_000)
+                .expect("trim clip");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(trimmed.start_sample, 60_000);
+        assert_eq!(trimmed.source_start_sample, 12_000);
+        assert_eq!(trimmed.duration_samples, 12_000);
+        assert_eq!(project.tracks[0].clips, vec![trimmed]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn splits_clip_through_command_log() {
+        let project_dir = temp_project_dir("clip-split");
+        init_project(&project_dir, "Clip Split").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+
+        let (left, right) = split_clip(&project_dir, &clip.id, 60_000).expect("split clip");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(left.start_sample, 48_000);
+        assert_eq!(left.source_start_sample, 0);
+        assert_eq!(left.duration_samples, 12_000);
+        assert_eq!(right.start_sample, 60_000);
+        assert_eq!(right.source_start_sample, 12_000);
+        assert_eq!(right.duration_samples, 12_000);
+        assert_eq!(project.tracks[0].clips, vec![left, right]);
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");

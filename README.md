@@ -28,8 +28,8 @@ platform is macOS, with the architecture kept portable where practical.
 - Native UI metronome during playback and recording.
 - Non-blocking recording count-in.
 - Imported WAV media, waveform cache generation, and waveform drawing.
-- Clip selection, deletion, command-log-backed placement edits, and horizontal
-  timeline dragging.
+- Clip selection, deletion, command-log-backed placement edits, horizontal
+  timeline dragging, trim handles, and split-at-playhead editing.
 - Time-based and tempo-derived beat-grid snapping in the arrangement.
 - Optional Git integration through system Git, including private remote support
   via the user's existing credentials.
