@@ -26,6 +26,7 @@ platform is macOS, with the architecture kept portable where practical.
 - Command-log-backed project tempo.
 - Generated metronome click rendering and playback.
 - Native UI metronome during playback and recording.
+- Non-blocking recording count-in.
 - Imported WAV media, waveform cache generation, and waveform drawing.
 - Clip selection, deletion, command-log-backed placement edits, and horizontal
   timeline dragging.

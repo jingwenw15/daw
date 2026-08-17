@@ -391,3 +391,16 @@ is heard without writing the click into the recorded clip file.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 33
+
+Recording has a non-blocking count-in. The transport exposes a `Count-In` toggle
+and bar count; pressing Record plays a generated metronome count-in first, keeps
+the UI responsive, and starts input recording automatically when the count-in
+playback finishes. Cancelling the count-in stops the pending recording before
+any input stream is opened.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

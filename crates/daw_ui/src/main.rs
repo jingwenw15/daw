@@ -44,6 +44,8 @@ struct DawApp {
     mixer_solo: bool,
     timeline_zoom: f32,
     metronome_enabled: bool,
+    count_in_enabled: bool,
+    count_in_bars: u32,
     snap_enabled: bool,
     snap_mode: SnapMode,
     snap_grid_ms: u32,
@@ -59,6 +61,7 @@ struct DawApp {
     history: Vec<daw_model::HistoryItem>,
     playback: Option<ActivePlayback>,
     recording: Option<ActiveRecording>,
+    count_in: Option<ActiveCountIn>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +79,12 @@ struct ActiveRecording {
 
 struct ActivePlayback {
     transport: daw_engine::PlaybackTransport,
+    start_sample: u64,
+}
+
+struct ActiveCountIn {
+    transport: daw_engine::PlaybackTransport,
+    track_id: daw_model::StableId,
     start_sample: u64,
 }
 
@@ -181,6 +190,8 @@ impl Default for DawApp {
             mixer_solo: false,
             timeline_zoom: 1.0,
             metronome_enabled: false,
+            count_in_enabled: false,
+            count_in_bars: 1,
             snap_enabled: true,
             snap_mode: SnapMode::Time,
             snap_grid_ms: DEFAULT_SNAP_GRID_MS,
@@ -196,6 +207,7 @@ impl Default for DawApp {
             history: Vec::new(),
             playback: None,
             recording: None,
+            count_in: None,
         }
     }
 }
@@ -203,8 +215,13 @@ impl Default for DawApp {
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll_playback();
+        self.poll_count_in();
         self.handle_shortcuts(ctx);
-        if self.recording.is_some() || self.playback.is_some() || self.clip_drag.is_some() {
+        if self.recording.is_some()
+            || self.playback.is_some()
+            || self.count_in.is_some()
+            || self.clip_drag.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
         self.render_transport(ctx);
@@ -252,6 +269,14 @@ impl DawApp {
                     self.set_project_tempo();
                 }
                 ui.checkbox(&mut self.metronome_enabled, "Metronome");
+                ui.checkbox(&mut self.count_in_enabled, "Count-In");
+                ui.add_enabled(
+                    self.count_in_enabled,
+                    egui::DragValue::new(&mut self.count_in_bars)
+                        .range(1..=4)
+                        .speed(1.0)
+                        .suffix(" bars"),
+                );
                 ui.checkbox(&mut self.snap_enabled, "Snap");
                 ui.add_enabled_ui(self.snap_enabled, |ui| {
                     egui::ComboBox::from_id_salt("snap-mode")
@@ -296,19 +321,24 @@ impl DawApp {
                 {
                     self.stop_playback();
                 }
-                let record_label = if self.recording.is_some() {
+                let record_label = if self.count_in.is_some() {
+                    "Cancel Count-In"
+                } else if self.recording.is_some() {
                     "Stop Recording"
                 } else {
                     "Record"
                 };
-                let record_button =
-                    egui::Button::new(record_label).fill(if self.recording.is_some() {
+                let record_button = egui::Button::new(record_label).fill(
+                    if self.recording.is_some() || self.count_in.is_some() {
                         egui::Color32::from_rgb(178, 40, 48)
                     } else {
                         egui::Color32::from_rgb(114, 28, 36)
-                    });
+                    },
+                );
                 if ui.add(record_button).clicked() {
-                    if self.recording.is_some() {
+                    if self.count_in.is_some() {
+                        self.cancel_count_in();
+                    } else if self.recording.is_some() {
                         self.stop_recording();
                     } else {
                         self.start_recording();
@@ -451,6 +481,9 @@ impl DawApp {
                     ui.heading(&project.name);
                     if self.recording.is_some() {
                         ui.colored_label(egui::Color32::from_rgb(220, 72, 82), "recording");
+                    }
+                    if self.count_in.is_some() {
+                        ui.colored_label(egui::Color32::from_rgb(238, 194, 78), "count-in");
                     }
                     ui.label(format!("{} BPM", project.tempo_bpm));
                     ui.label(format!("{} tracks", project.tracks.len()));
@@ -728,6 +761,10 @@ impl DawApp {
             "Already recording".clone_into(&mut self.status);
             return;
         }
+        if self.count_in.is_some() {
+            "Count-in is already running".clone_into(&mut self.status);
+            return;
+        }
         if self.recording_track_id.is_empty() {
             self.use_first_recording_track();
         }
@@ -745,6 +782,43 @@ impl DawApp {
             "Add a track before recording".clone_into(&mut self.status);
             return;
         }
+        let track_id = daw_model::StableId::from_string(self.recording_track_id.clone());
+        if self.count_in_enabled {
+            self.start_count_in(track_id, start_sample);
+        } else {
+            self.begin_recording(track_id, start_sample);
+        }
+    }
+
+    fn start_count_in(&mut self, track_id: daw_model::StableId, start_sample: u64) {
+        let buffer = match render_count_in_metronome(self.project_tempo_bpm, self.count_in_bars) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        match daw_engine::start_buffer_playback(buffer) {
+            Ok(transport) => {
+                self.status = format!("Counting in for {} bar(s)", self.count_in_bars);
+                self.count_in = Some(ActiveCountIn {
+                    transport,
+                    track_id,
+                    start_sample,
+                });
+            }
+            Err(error) => self.status = format!("Count-in playback failed: {error}"),
+        }
+    }
+
+    fn cancel_count_in(&mut self) {
+        if let Some(mut count_in) = self.count_in.take() {
+            let _ = count_in.transport.stop();
+            "Count-in cancelled".clone_into(&mut self.status);
+        }
+    }
+
+    fn begin_recording(&mut self, track_id: daw_model::StableId, start_sample: u64) {
         match daw_engine::start_input_recording() {
             Ok(transport) => {
                 let metronome = if self.metronome_enabled {
@@ -771,7 +845,7 @@ impl DawApp {
                 self.recording = Some(ActiveRecording {
                     transport,
                     metronome,
-                    track_id: daw_model::StableId::from_string(self.recording_track_id.clone()),
+                    track_id,
                     start_sample,
                 });
             }
@@ -1195,6 +1269,21 @@ impl DawApp {
         if playback.transport.is_finished() {
             self.stop_playback();
         }
+    }
+
+    fn poll_count_in(&mut self) {
+        let finished = self
+            .count_in
+            .as_ref()
+            .is_some_and(|count_in| count_in.transport.is_finished());
+        if !finished {
+            return;
+        }
+        let Some(mut count_in) = self.count_in.take() else {
+            return;
+        };
+        let _ = count_in.transport.stop();
+        self.begin_recording(count_in.track_id, count_in.start_sample);
     }
 }
 
@@ -2206,6 +2295,17 @@ fn mix_metronome_into_buffer(
     Ok(())
 }
 
+fn render_count_in_metronome(tempo_bpm: u16, bars: u32) -> Result<daw_engine::AudioBuffer, String> {
+    daw_engine::render_metronome(
+        tempo_bpm,
+        u16::try_from(BEATS_PER_BAR).unwrap_or(4),
+        bars,
+        daw_engine::DEFAULT_SAMPLE_RATE,
+        daw_engine::DEFAULT_CHANNELS,
+    )
+    .map_err(|error| format!("Count-in render failed: {error}"))
+}
+
 fn mix_clip_from_project(
     project_path: &Path,
     project: &daw_model::Project,
@@ -2339,7 +2439,8 @@ fn duration_to_frames(duration: f32, sample_rate: u32) -> Result<usize, String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        mix_metronome_into_buffer, samples_per_beat, snap_grid_samples_from_ms, snap_sample,
+        mix_metronome_into_buffer, render_count_in_metronome, samples_per_beat,
+        snap_grid_samples_from_ms, snap_sample,
     };
 
     #[test]
@@ -2375,5 +2476,12 @@ mod tests {
         mix_metronome_into_buffer(&mut buffer, 120).expect("mix metronome");
 
         assert!(buffer.samples.iter().any(|sample| sample.abs() > 0.0));
+    }
+
+    #[test]
+    fn renders_count_in_for_requested_bars() {
+        let buffer = render_count_in_metronome(120, 1).expect("render count-in");
+
+        assert_eq!(buffer.frames(), 96_000);
     }
 }
