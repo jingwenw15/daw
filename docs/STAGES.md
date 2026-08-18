@@ -445,3 +445,17 @@ cargo run --bin daw -- redo /tmp/my-session
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 37
+
+Core clip editing actions are visible in a bottom edit toolbar instead of being
+buried in advanced project tools. The toolbar shows selected clip timing,
+disables unavailable actions, and exposes Undo, Redo, Split, Duplicate, and
+Delete controls. Timeline shortcuts now include `S` to split the selected clip
+at the playhead and `D` to duplicate it at the playhead when text fields are not
+focused.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

@@ -383,18 +383,8 @@ impl DawApp {
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(&self.status);
-                    if let Some(project) = &self.project {
-                        if let Some(clip) = selected_clip(project, self.selected_clip_id.as_ref()) {
-                            ui.separator();
-                            ui.label(format!(
-                                "Selected clip {}  start {}  duration {}",
-                                clip.id, clip.start_sample, clip.duration_samples
-                            ));
-                            if ui.button("Delete Clip").clicked() {
-                                self.remove_selected_clip();
-                            }
-                        }
-                    }
+                    ui.separator();
+                    self.render_edit_toolbar(ui);
                     ui.separator();
                     if ui.button("Validate").clicked() {
                         self.validate_project();
@@ -416,6 +406,63 @@ impl DawApp {
                     });
                 });
             });
+    }
+
+    fn render_edit_toolbar(&mut self, ui: &mut egui::Ui) {
+        let has_project = self.project.is_some();
+        let selected_summary = self
+            .project
+            .as_ref()
+            .and_then(|project| selected_clip(project, self.selected_clip_id.as_ref()))
+            .map(|clip| {
+                format!(
+                    "Clip {} · start {} · duration {}",
+                    clip.id, clip.start_sample, clip.duration_samples
+                )
+            });
+        let has_clip = selected_summary.is_some();
+
+        ui.strong("Edit");
+        if ui
+            .add_enabled(has_project, egui::Button::new("Undo"))
+            .on_hover_text("Cmd+Z")
+            .clicked()
+        {
+            self.undo_project_edit();
+        }
+        if ui
+            .add_enabled(has_project, egui::Button::new("Redo"))
+            .on_hover_text("Cmd+Shift+Z")
+            .clicked()
+        {
+            self.redo_project_edit();
+        }
+        if ui
+            .add_enabled(has_clip, egui::Button::new("Split"))
+            .on_hover_text("S")
+            .clicked()
+        {
+            self.split_selected_clip();
+        }
+        if ui
+            .add_enabled(has_clip, egui::Button::new("Duplicate"))
+            .on_hover_text("D")
+            .clicked()
+        {
+            self.duplicate_selected_clip();
+        }
+        if ui
+            .add_enabled(has_clip, egui::Button::new("Delete"))
+            .on_hover_text("Delete")
+            .clicked()
+        {
+            self.remove_selected_clip();
+        }
+        if let Some(summary) = selected_summary {
+            ui.label(summary);
+        } else {
+            ui.label("No clip selected");
+        }
     }
 
     fn render_project_edit_section(&mut self, ui: &mut egui::Ui) {
@@ -1129,6 +1176,28 @@ impl DawApp {
         });
         if redo_pressed && !ctx.wants_keyboard_input() && self.project.is_some() {
             self.redo_project_edit();
+            return;
+        }
+        let split_pressed = ctx.input(|input| {
+            !input.modifiers.command
+                && !input.modifiers.shift
+                && !input.modifiers.alt
+                && !input.modifiers.ctrl
+                && input.key_pressed(egui::Key::S)
+        });
+        if split_pressed && !ctx.wants_keyboard_input() && self.selected_clip_id.is_some() {
+            self.split_selected_clip();
+            return;
+        }
+        let duplicate_pressed = ctx.input(|input| {
+            !input.modifiers.command
+                && !input.modifiers.shift
+                && !input.modifiers.alt
+                && !input.modifiers.ctrl
+                && input.key_pressed(egui::Key::D)
+        });
+        if duplicate_pressed && !ctx.wants_keyboard_input() && self.selected_clip_id.is_some() {
+            self.duplicate_selected_clip();
             return;
         }
         let enter_pressed = ctx.input(|input| input.key_pressed(egui::Key::Enter));
