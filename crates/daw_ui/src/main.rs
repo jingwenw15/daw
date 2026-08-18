@@ -260,6 +260,12 @@ impl DawApp {
                 if ui.button("Open").clicked() {
                     self.reload_project();
                 }
+                if ui.button("Undo").clicked() {
+                    self.undo_project_edit();
+                }
+                if ui.button("Redo").clicked() {
+                    self.redo_project_edit();
+                }
                 ui.separator();
                 ui.label("Playhead");
                 ui.add_sized(
@@ -476,6 +482,9 @@ impl DawApp {
             }
             if ui.button("Split Clip").clicked() {
                 self.split_selected_clip();
+            }
+            if ui.button("Duplicate Clip").clicked() {
+                self.duplicate_selected_clip();
             }
         });
         ui.separator();
@@ -1108,6 +1117,20 @@ impl DawApp {
         if self.clip_drag.is_some() {
             return;
         }
+        let undo_pressed = ctx.input(|input| {
+            input.modifiers.command && !input.modifiers.shift && input.key_pressed(egui::Key::Z)
+        });
+        if undo_pressed && !ctx.wants_keyboard_input() && self.project.is_some() {
+            self.undo_project_edit();
+            return;
+        }
+        let redo_pressed = ctx.input(|input| {
+            input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::Z)
+        });
+        if redo_pressed && !ctx.wants_keyboard_input() && self.project.is_some() {
+            self.redo_project_edit();
+            return;
+        }
         let enter_pressed = ctx.input(|input| input.key_pressed(egui::Key::Enter));
         if enter_pressed && self.project.is_some() {
             self.play_project();
@@ -1213,6 +1236,30 @@ impl DawApp {
         }
     }
 
+    fn undo_project_edit(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::undo_project(&path) {
+            Ok(_) => {
+                self.selected_clip_id = None;
+                self.edit_clip_id.clear();
+                self.refresh_project_after_edit("Undo complete");
+            }
+            Err(error) => self.status = format!("Undo failed: {error}"),
+        }
+    }
+
+    fn redo_project_edit(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::redo_project(&path) {
+            Ok(_) => {
+                self.selected_clip_id = None;
+                self.edit_clip_id.clear();
+                self.refresh_project_after_edit("Redo complete");
+            }
+            Err(error) => self.status = format!("Redo failed: {error}"),
+        }
+    }
+
     fn split_selected_clip(&mut self) {
         let Some(clip_id) = self.selected_clip_id.clone() else {
             "No clip selected".clone_into(&mut self.status);
@@ -1236,6 +1283,32 @@ impl DawApp {
                 ));
             }
             Err(error) => self.status = format!("Split clip failed: {error}"),
+        }
+    }
+
+    fn duplicate_selected_clip(&mut self) {
+        let Some(clip_id) = self.selected_clip_id.clone() else {
+            "No clip selected".clone_into(&mut self.status);
+            return;
+        };
+        let start_sample = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::duplicate_clip(&path, &clip_id, None, start_sample) {
+            Ok(clip) => {
+                self.selected_clip_id = Some(clip.id.clone());
+                self.set_clip_edit_fields(&clip);
+                self.refresh_project_after_edit(format!(
+                    "Duplicated clip {} to {}",
+                    clip.id, clip.start_sample
+                ));
+            }
+            Err(error) => self.status = format!("Duplicate clip failed: {error}"),
         }
     }
 

@@ -417,3 +417,31 @@ cargo run --bin daw -- clip split /tmp/my-session <clip-id> <split-sample>
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 35
+
+Selected clips can be duplicated at the playhead. Duplicates preserve the source
+media offset and duration, so copied clips keep the audible region from prior
+trim or split edits. The CLI exposes the same operation and can optionally place
+the duplicate on a target track.
+
+```sh
+cargo run --bin daw -- clip duplicate /tmp/my-session <clip-id> <start-sample> [track-id]
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 36
+
+Project edits can be undone and redone through deterministic restore commands
+in the command log. The CLI exposes top-level `undo` and `redo` commands, and
+the native UI exposes transport buttons plus Cmd+Z and Cmd+Shift+Z shortcuts
+when text fields are not focused. This first pass stores project states for
+restore operations rather than hand-writing inverse logic for every edit type.
+
+```sh
+cargo run --bin daw -- undo /tmp/my-session
+cargo run --bin daw -- redo /tmp/my-session
+cargo test
+cargo run --bin daw-ui
+```

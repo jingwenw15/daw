@@ -29,7 +29,9 @@ platform is macOS, with the architecture kept portable where practical.
 - Non-blocking recording count-in.
 - Imported WAV media, waveform cache generation, and waveform drawing.
 - Clip selection, deletion, command-log-backed placement edits, horizontal
-  timeline dragging, trim handles, and split-at-playhead editing.
+  timeline dragging, trim handles, split-at-playhead editing, and clip
+  duplication.
+- Command-log-backed undo and redo for project edits.
 - Time-based and tempo-derived beat-grid snapping in the arrangement.
 - Optional Git integration through system Git, including private remote support
   via the user's existing credentials.

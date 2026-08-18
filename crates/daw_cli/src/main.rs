@@ -79,6 +79,8 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             }
             Ok(())
         }
+        Some("undo") => run_undo(args),
+        Some("redo") => run_redo(args),
         Some("checkout-snapshot") => run_checkout_snapshot(args),
         Some("diff") => run_diff(args),
         Some("merge") => run_merge(args),
@@ -93,6 +95,32 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             "unknown command: {command}\nrun `daw --help` for usage"
         )),
     }
+}
+
+fn run_undo(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let path = required_arg(&mut args, "path")?;
+    no_extra_args(args)?;
+    let project =
+        daw_model::undo_project(path.as_ref()).map_err(|error| format!("undo failed: {error}"))?;
+    println!(
+        "undid latest command; project has {} tracks and {} media references",
+        project.tracks.len(),
+        project.media.len()
+    );
+    Ok(())
+}
+
+fn run_redo(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let path = required_arg(&mut args, "path")?;
+    no_extra_args(args)?;
+    let project =
+        daw_model::redo_project(path.as_ref()).map_err(|error| format!("redo failed: {error}"))?;
+    println!(
+        "redid latest command; project has {} tracks and {} media references",
+        project.tracks.len(),
+        project.media.len()
+    );
+    Ok(())
 }
 
 fn run_record_snippet(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -409,6 +437,25 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             println!(
                 "split clip into {} ({} samples) and {} ({} samples)",
                 left.id, left.duration_samples, right.id, right.duration_samples
+            );
+            Ok(())
+        }
+        Some("duplicate") => {
+            let project = required_arg(&mut args, "path")?;
+            let clip_id = required_arg(&mut args, "clip-id")?;
+            let start_sample = required_u64(&mut args, "start-sample")?;
+            let track_id = args.next().map(daw_model::StableId::from_string);
+            no_extra_args(args)?;
+            let clip = daw_model::duplicate_clip(
+                project.as_ref(),
+                &daw_model::StableId::from_string(clip_id),
+                track_id.as_ref(),
+                start_sample,
+            )
+            .map_err(|error| format!("failed to duplicate clip: {error}"))?;
+            println!(
+                "duplicated clip {} at {} for {}",
+                clip.id, clip.start_sample, clip.duration_samples
             );
             Ok(())
         }
@@ -826,6 +873,7 @@ fn print_help() {
     println!("  daw clip add <path> <track-id> <media-id> <start-sample> <duration-samples>");
     println!("  daw clip move <path> <clip-id> <start-sample> <duration-samples>");
     println!("  daw clip split <path> <clip-id> <split-sample>");
+    println!("  daw clip duplicate <path> <clip-id> <start-sample> [track-id]");
     println!("  daw clip remove <path> <clip-id>");
     println!("  daw snapshot create <path> [message]");
     println!("  daw branch create <path> <name>");
@@ -854,6 +902,8 @@ fn print_help() {
     println!("  daw diff <path> <left-ref> <right-ref>");
     println!("  daw merge <path> <source-branch>");
     println!("  daw history <path>");
+    println!("  daw undo <path>");
+    println!("  daw redo <path>");
     println!("  daw checkout-snapshot <path> <snapshot-id>");
     println!("  daw replay <path>");
 }

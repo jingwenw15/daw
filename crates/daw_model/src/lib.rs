@@ -192,6 +192,27 @@ pub enum ProjectCommand {
         /// Snapshot identifier to restore.
         snapshot_id: StableId,
     },
+    /// Replace current state with a project state for undo/redo.
+    RestoreProject {
+        /// Project state to restore.
+        project: Box<Project>,
+        /// Undo or redo operation kind.
+        kind: RestoreKind,
+        /// Command targeted by this undo/redo restore.
+        target_entry_id: StableId,
+        /// Opposite project state used by redo after an undo.
+        alternate_project: Option<Box<Project>>,
+    },
+}
+
+/// Project restore operation kind.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreKind {
+    /// Restore the project to the state before a command.
+    Undo,
+    /// Restore the project to the state after an undone command.
+    Redo,
 }
 
 /// Command log entry with stable metadata.
@@ -478,6 +499,14 @@ impl ProjectCommand {
             Self::CheckoutSnapshot { snapshot_id } => {
                 format!("checkout snapshot {snapshot_id}")
             }
+            Self::RestoreProject {
+                kind,
+                target_entry_id,
+                ..
+            } => match kind {
+                RestoreKind::Undo => format!("undo command {target_entry_id}"),
+                RestoreKind::Redo => format!("redo command {target_entry_id}"),
+            },
         }
     }
 }
@@ -916,6 +945,104 @@ pub fn split_clip(
     Ok((left, right))
 }
 
+/// Duplicate an existing clip at a new timeline start, optionally on another track.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the source clip or target
+/// track is unknown, the duplicated placement is invalid, or the updated project
+/// cannot be saved.
+pub fn duplicate_clip(
+    project_dir: &Path,
+    clip_id: &StableId,
+    track_id: Option<&StableId>,
+    start_sample: u64,
+) -> Result<Clip, ProjectIoError> {
+    let project = load_project(project_dir)?;
+    let source = find_clip(&project, clip_id)
+        .cloned()
+        .ok_or_else(|| unknown_clip_error(clip_id))?;
+    let target_track_id = track_id
+        .cloned()
+        .or_else(|| track_id_for_clip(&project, clip_id).cloned())
+        .ok_or_else(|| unknown_clip_error(clip_id))?;
+    let clip = Clip {
+        id: StableId::new(),
+        media_id: source.media_id,
+        start_sample,
+        source_start_sample: source.source_start_sample,
+        duration_samples: source.duration_samples,
+    };
+    append_and_apply(
+        project_dir,
+        ProjectCommand::AddClip {
+            track_id: target_track_id,
+            clip: clip.clone(),
+        },
+    )?;
+    Ok(clip)
+}
+
+/// Undo the latest undoable project command.
+///
+/// # Errors
+///
+/// Returns an error if there is no command to undo, replay fails, or the
+/// restored project cannot be saved.
+pub fn undo_project(project_dir: &Path) -> Result<Project, ProjectIoError> {
+    let entries = read_command_log(project_dir)?;
+    let target_index = undo_target_index(&entries)
+        .ok_or_else(|| ProjectIoError::Invalid(vec![ValidationError::new("nothing to undo")]))?;
+    let target_entry_id = entries[target_index].id.clone();
+    let previous = replay_command_entries(project_dir, &entries[..target_index])?;
+    let current = load_project(project_dir)?;
+    append_and_apply(
+        project_dir,
+        ProjectCommand::RestoreProject {
+            project: Box::new(previous),
+            kind: RestoreKind::Undo,
+            target_entry_id,
+            alternate_project: Some(Box::new(current)),
+        },
+    )
+}
+
+/// Redo the latest undone project command.
+///
+/// # Errors
+///
+/// Returns an error if there is no redo state, replay fails, or the restored
+/// project cannot be saved.
+pub fn redo_project(project_dir: &Path) -> Result<Project, ProjectIoError> {
+    let entries = read_command_log(project_dir)?;
+    let Some(last) = entries.last() else {
+        return Err(ProjectIoError::Invalid(vec![ValidationError::new(
+            "nothing to redo",
+        )]));
+    };
+    let ProjectCommand::RestoreProject {
+        kind: RestoreKind::Undo,
+        target_entry_id,
+        alternate_project: Some(project),
+        ..
+    } = &last.command
+    else {
+        return Err(ProjectIoError::Invalid(vec![ValidationError::new(
+            "nothing to redo",
+        )]));
+    };
+    let current = load_project(project_dir)?;
+    append_and_apply(
+        project_dir,
+        ProjectCommand::RestoreProject {
+            project: project.clone(),
+            kind: RestoreKind::Redo,
+            target_entry_id: target_entry_id.clone(),
+            alternate_project: Some(Box::new(current)),
+        },
+    )
+}
+
 /// Remove an existing clip.
 ///
 /// # Errors
@@ -1150,10 +1277,17 @@ pub fn history(project_dir: &Path) -> Result<Vec<HistoryItem>, ProjectIoError> {
 ///
 /// Returns an error if replay inputs cannot be loaded, parsed, or validated.
 pub fn replay_project(project_dir: &Path) -> Result<Project, ProjectIoError> {
+    replay_command_entries(project_dir, &read_command_log(project_dir)?)
+}
+
+fn replay_command_entries(
+    project_dir: &Path,
+    entries: &[CommandEntry],
+) -> Result<Project, ProjectIoError> {
     let json = fs::read_to_string(base_project_path(project_dir))?;
     let mut project = serde_json::from_str::<Project>(&json)?;
 
-    for entry in read_command_log(project_dir)? {
+    for entry in entries {
         project = apply_command(project_dir, project, &entry.command)?;
     }
 
@@ -1163,6 +1297,36 @@ pub fn replay_project(project_dir: &Path) -> Result<Project, ProjectIoError> {
     } else {
         Err(ProjectIoError::Invalid(errors))
     }
+}
+
+fn undo_target_index(entries: &[CommandEntry]) -> Option<usize> {
+    let last = entries.last()?;
+    match &last.command {
+        ProjectCommand::RestoreProject {
+            kind: RestoreKind::Undo,
+            target_entry_id,
+            ..
+        } => {
+            let previous_target = entries
+                .iter()
+                .position(|entry| &entry.id == target_entry_id)?;
+            previous_undoable_entry_index(entries, previous_target)
+        }
+        ProjectCommand::RestoreProject {
+            kind: RestoreKind::Redo,
+            target_entry_id,
+            ..
+        } => entries
+            .iter()
+            .position(|entry| &entry.id == target_entry_id),
+        _ => previous_undoable_entry_index(entries, entries.len()),
+    }
+}
+
+fn previous_undoable_entry_index(entries: &[CommandEntry], before_index: usize) -> Option<usize> {
+    entries[..before_index]
+        .iter()
+        .rposition(|entry| !matches!(entry.command, ProjectCommand::RestoreProject { .. }))
 }
 
 fn append_and_apply(
@@ -1236,6 +1400,9 @@ fn apply_command(
         } => apply_set_track_controls(project, track_id, *volume_percent, *muted, *solo),
         ProjectCommand::CheckoutSnapshot { snapshot_id } => {
             Ok(load_snapshot(project_dir, snapshot_id)?.project)
+        }
+        ProjectCommand::RestoreProject { project, .. } => {
+            validate_project_state((**project).clone())
         }
     }
 }
@@ -1448,6 +1615,14 @@ fn find_clip<'a>(project: &'a Project, clip_id: &StableId) -> Option<&'a Clip> {
         .find(|clip| clip.id == *clip_id)
 }
 
+fn track_id_for_clip<'a>(project: &'a Project, clip_id: &StableId) -> Option<&'a StableId> {
+    project
+        .tracks
+        .iter()
+        .find(|track| track.clips.iter().any(|clip| clip.id == *clip_id))
+        .map(|track| &track.id)
+}
+
 fn find_clip_mut<'a>(project: &'a mut Project, clip_id: &StableId) -> Option<&'a mut Clip> {
     project
         .tracks
@@ -1619,11 +1794,12 @@ fn default_project_tempo_bpm() -> u16 {
 mod tests {
     use super::{
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
-        create_snapshot, diff, init_project, list_branches, load_project, merge_branch,
-        project_file_path, remove_clip, remove_track, replay_project, set_clip_placement,
-        set_clip_placement_on_track, set_clip_timing_on_track, set_project_tempo,
-        set_track_controls, set_track_name, split_clip, switch_branch, Project, ProjectIoError,
-        StableId, Track, DEFAULT_TEMPO_BPM, PROJECT_SCHEMA_VERSION,
+        create_snapshot, diff, duplicate_clip, init_project, list_branches, load_project,
+        merge_branch, project_file_path, redo_project, remove_clip, remove_track, replay_project,
+        set_clip_placement, set_clip_placement_on_track, set_clip_timing_on_track,
+        set_project_tempo, set_track_controls, set_track_name, split_clip, switch_branch,
+        undo_project, Project, ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM,
+        PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1757,6 +1933,30 @@ mod tests {
 
         assert_eq!(loaded.tracks, vec![track]);
         assert_eq!(replayed, loaded);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn undoes_and_redoes_project_commands_through_command_log() {
+        let project_dir = temp_project_dir("undo-redo");
+        init_project(&project_dir, "Undo Redo").expect("init project");
+        let drums = add_track(&project_dir, "Drums").expect("add drums");
+        let bass = add_track(&project_dir, "Bass").expect("add bass");
+
+        let first_undo = undo_project(&project_dir).expect("undo bass");
+        assert_eq!(first_undo.tracks, vec![drums.clone()]);
+
+        let second_undo = undo_project(&project_dir).expect("undo drums");
+        assert!(second_undo.tracks.is_empty());
+
+        let redo = redo_project(&project_dir).expect("redo drums");
+        assert_eq!(redo.tracks, vec![drums]);
+
+        let replayed = replay_project(&project_dir).expect("replay project");
+        let project = load_project(&project_dir).expect("load project");
+        assert_eq!(project, replayed);
+        assert!(!project.tracks.iter().any(|track| track.id == bass.id));
 
         fs::remove_dir_all(project_dir).expect("cleanup project");
     }
@@ -1908,6 +2108,34 @@ mod tests {
         assert_eq!(right.source_start_sample, 12_000);
         assert_eq!(right.duration_samples, 12_000);
         assert_eq!(project.tracks[0].clips, vec![left, right]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn duplicates_trimmed_clip_through_command_log() {
+        let project_dir = temp_project_dir("clip-duplicate");
+        init_project(&project_dir, "Clip Duplicate").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+        let trimmed =
+            set_clip_timing_on_track(&project_dir, &clip.id, None, 60_000, Some(12_000), 12_000)
+                .expect("trim clip");
+
+        let duplicated =
+            duplicate_clip(&project_dir, &trimmed.id, None, 96_000).expect("duplicate clip");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_ne!(duplicated.id, trimmed.id);
+        assert_eq!(duplicated.media_id, trimmed.media_id);
+        assert_eq!(duplicated.start_sample, 96_000);
+        assert_eq!(duplicated.source_start_sample, 12_000);
+        assert_eq!(duplicated.duration_samples, 12_000);
+        assert_eq!(project.tracks[0].clips, vec![trimmed, duplicated]);
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");
