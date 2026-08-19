@@ -473,3 +473,16 @@ cross-track movement.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 39
+
+The native transport has first-pass loop-region playback. Loop mode uses
+session-local start/end sample fields, can set a one-bar loop from the current
+playhead, renders only the loop span, and plays it through the engine's looping
+buffer transport. The visible playhead wraps inside the loop region while
+playback runs.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

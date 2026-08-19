@@ -23,6 +23,7 @@ platform is macOS, with the architecture kept portable where practical.
 - Track creation, deletion, renaming, arming, volume, mute, and solo controls.
 - Audio recording from the default input device.
 - Timeline playback from a movable playhead.
+- Session loop-region playback from the native transport.
 - Command-log-backed project tempo.
 - Generated metronome click rendering and playback.
 - Native UI metronome during playback and recording.

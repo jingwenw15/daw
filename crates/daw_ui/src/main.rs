@@ -28,6 +28,9 @@ struct DawApp {
     new_track_name: String,
     project_tempo_bpm: u16,
     playhead_sample: String,
+    loop_enabled: bool,
+    loop_start_sample: String,
+    loop_end_sample: String,
     media_source_path: String,
     clip_track_id: String,
     clip_media_id: String,
@@ -80,6 +83,13 @@ struct ActiveRecording {
 struct ActivePlayback {
     transport: daw_engine::PlaybackTransport,
     start_sample: u64,
+    loop_region: Option<LoopRegion>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LoopRegion {
+    start_sample: u64,
+    end_sample: u64,
 }
 
 struct ActiveCountIn {
@@ -202,6 +212,9 @@ impl Default for DawApp {
             new_track_name: "Audio".to_owned(),
             project_tempo_bpm: daw_model::DEFAULT_TEMPO_BPM,
             playhead_sample: "0".to_owned(),
+            loop_enabled: false,
+            loop_start_sample: "0".to_owned(),
+            loop_end_sample: "192000".to_owned(),
             media_source_path: "/private/tmp/test-tone.wav".to_owned(),
             clip_track_id: String::new(),
             clip_media_id: String::new(),
@@ -341,6 +354,22 @@ impl DawApp {
                                     .suffix(" beat"),
                             );
                         }
+                    }
+                });
+                ui.checkbox(&mut self.loop_enabled, "Loop");
+                ui.add_enabled_ui(self.loop_enabled, |ui| {
+                    ui.label("Loop");
+                    ui.add_sized(
+                        [78.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.loop_start_sample),
+                    );
+                    ui.label("to");
+                    ui.add_sized(
+                        [78.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.loop_end_sample),
+                    );
+                    if ui.button("Set From View").clicked() {
+                        self.set_loop_from_playhead();
                     }
                 });
                 if ui
@@ -1524,12 +1553,7 @@ impl DawApp {
         }
     }
 
-    fn play_project(&mut self) {
-        if self.playback.is_some() {
-            self.stop_playback();
-        }
-
-        let path = PathBuf::from(&self.project_path);
+    fn set_loop_from_playhead(&mut self) {
         let start_sample = match parse_u64(&self.playhead_sample, "playhead") {
             Ok(value) => value,
             Err(error) => {
@@ -1537,26 +1561,85 @@ impl DawApp {
                 return;
             }
         };
-        match render_project_buffer(&path, 1.0, start_sample, self.metronome_enabled).and_then(
-            |buffer| {
-                daw_engine::start_buffer_playback(buffer)
-                    .map_err(|error| format!("Playback failed: {error}"))
-            },
-        ) {
+        let loop_samples = samples_per_beat(self.project_tempo_bpm).saturating_mul(BEATS_PER_BAR);
+        self.loop_start_sample = start_sample.to_string();
+        self.loop_end_sample = start_sample.saturating_add(loop_samples).to_string();
+        self.status = format!(
+            "Loop set from {} to {}",
+            self.loop_start_sample, self.loop_end_sample
+        );
+    }
+
+    fn loop_region(&self) -> Result<Option<LoopRegion>, String> {
+        if !self.loop_enabled {
+            return Ok(None);
+        }
+        let start_sample = parse_u64(&self.loop_start_sample, "loop start")?;
+        let end_sample = parse_u64(&self.loop_end_sample, "loop end")?;
+        if end_sample <= start_sample {
+            return Err("loop end must be greater than loop start".to_owned());
+        }
+        Ok(Some(LoopRegion {
+            start_sample,
+            end_sample,
+        }))
+    }
+
+    fn play_project(&mut self) {
+        if self.playback.is_some() {
+            self.stop_playback();
+        }
+
+        let path = PathBuf::from(&self.project_path);
+        let mut start_sample = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let loop_region = match self.loop_region() {
+            Ok(loop_region) => loop_region,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let render_end = loop_region.map(|region| {
+            start_sample = region.start_sample;
+            region.end_sample
+        });
+        match render_project_buffer(&path, 1.0, start_sample, render_end, self.metronome_enabled)
+            .and_then(|buffer| {
+                if loop_region.is_some() {
+                    daw_engine::start_looping_buffer_playback(buffer)
+                        .map_err(|error| format!("Playback failed: {error}"))
+                } else {
+                    daw_engine::start_buffer_playback(buffer)
+                        .map_err(|error| format!("Playback failed: {error}"))
+                }
+            }) {
             Ok(transport) => {
                 let metronome_status = if self.metronome_enabled {
                     " with metronome"
                 } else {
                     ""
                 };
+                let loop_status = if loop_region.is_some() {
+                    " looping"
+                } else {
+                    ""
+                };
                 self.status = format!(
-                    "Playing on '{}'{}",
+                    "Playing{} on '{}'{}",
+                    loop_status,
                     transport.report().device_name,
                     metronome_status
                 );
                 self.playback = Some(ActivePlayback {
                     transport,
                     start_sample,
+                    loop_region,
                 });
             }
             Err(error) => self.status = error,
@@ -1566,9 +1649,7 @@ impl DawApp {
     fn stop_playback(&mut self) {
         if let Some(mut playback) = self.playback.take() {
             let report = playback.transport.stop();
-            let playhead = playback
-                .start_sample
-                .saturating_add(u64::try_from(report.frames_played).unwrap_or(u64::MAX));
+            let playhead = playback_playhead(&playback, report.frames_played);
             self.playhead_sample = playhead.to_string();
             self.status = format!(
                 "Stopped after {} frames on '{}'",
@@ -1584,9 +1665,7 @@ impl DawApp {
             return;
         };
         let report = playback.transport.report();
-        let playhead = playback
-            .start_sample
-            .saturating_add(u64::try_from(report.frames_played).unwrap_or(u64::MAX));
+        let playhead = playback_playhead(playback, report.frames_played);
         self.playhead_sample = playhead.to_string();
         if playback.transport.is_finished() {
             self.stop_playback();
@@ -2789,24 +2868,45 @@ fn selected_clip_locations(
         .collect()
 }
 
+fn playback_playhead(playback: &ActivePlayback, frames_played: usize) -> u64 {
+    let elapsed = u64::try_from(frames_played).unwrap_or(u64::MAX);
+    if let Some(region) = playback.loop_region {
+        let length = region.end_sample.saturating_sub(region.start_sample).max(1);
+        region.start_sample.saturating_add(elapsed % length)
+    } else {
+        playback.start_sample.saturating_add(elapsed)
+    }
+}
+
 fn render_project_buffer(
     project_path: &Path,
     minimum_duration: f32,
     start_sample: u64,
+    end_sample: Option<u64>,
     include_metronome: bool,
 ) -> Result<daw_engine::AudioBuffer, String> {
     let project = daw_model::load_project(project_path)
         .map_err(|error| format!("Project is invalid: {error}"))?;
     let media_objects = daw_media::list_media(project_path)
         .map_err(|error| format!("Failed to list media: {error}"))?;
-    let mut total_frames = duration_to_frames(minimum_duration, daw_engine::DEFAULT_SAMPLE_RATE)?;
-    for track in &project.tracks {
-        for clip in &track.clips {
-            let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
-            if clip_end > start_sample {
-                let relative_end = usize::try_from(clip_end - start_sample)
-                    .map_err(|_| "Clip timeline position is too large".to_owned())?;
-                total_frames = total_frames.max(relative_end);
+    let mut total_frames = if let Some(end_sample) = end_sample {
+        if end_sample <= start_sample {
+            return Err("render end must be greater than render start".to_owned());
+        }
+        usize::try_from(end_sample - start_sample)
+            .map_err(|_| "Render timeline span is too large".to_owned())?
+    } else {
+        duration_to_frames(minimum_duration, daw_engine::DEFAULT_SAMPLE_RATE)?
+    };
+    if end_sample.is_none() {
+        for track in &project.tracks {
+            for clip in &track.clips {
+                let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+                if clip_end > start_sample {
+                    let relative_end = usize::try_from(clip_end - start_sample)
+                        .map_err(|_| "Clip timeline position is too large".to_owned())?;
+                    total_frames = total_frames.max(relative_end);
+                }
             }
         }
     }
