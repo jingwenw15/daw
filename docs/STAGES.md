@@ -459,3 +459,17 @@ focused.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 38
+
+Timeline clips support a first multi-select workflow. Cmd-click toggles clip
+selection, the edit toolbar shows multi-selection counts, Delete removes all
+selected clips, Duplicate copies all selected clips to the playhead while
+preserving relative timing, and dragging one selected clip moves the selected
+group horizontally on their original tracks. Single-clip drags still support
+cross-track movement.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

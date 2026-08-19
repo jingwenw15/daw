@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, scroll_area::ScrollSource};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -50,7 +50,7 @@ struct DawApp {
     snap_mode: SnapMode,
     snap_grid_ms: u32,
     snap_beat_division: u16,
-    selected_clip_id: Option<daw_model::StableId>,
+    selected_clip_ids: BTreeSet<daw_model::StableId>,
     clip_drag: Option<ActiveClipDrag>,
     track_name_edits: BTreeMap<String, String>,
     snapshot_message: String,
@@ -114,6 +114,17 @@ struct ActiveClipDrag {
     current_start_sample: u64,
     current_source_start_sample: u64,
     start_pointer_x: f32,
+    group_members: Vec<ActiveClipDragMember>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveClipDragMember {
+    clip_id: daw_model::StableId,
+    track_id: daw_model::StableId,
+    original_start_sample: u64,
+    current_start_sample: u64,
+    source_start_sample: u64,
+    duration_samples: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,7 +176,10 @@ enum ArrangementAction {
     },
     EndClipDrag,
     SetPlayhead(u64),
-    SelectClip(daw_model::StableId),
+    SelectClip {
+        clip_id: daw_model::StableId,
+        toggle: bool,
+    },
     ArmTrack(daw_model::StableId),
     RemoveTrack(daw_model::StableId),
     RenameTrack {
@@ -210,7 +224,7 @@ impl Default for DawApp {
             snap_mode: SnapMode::Time,
             snap_grid_ms: DEFAULT_SNAP_GRID_MS,
             snap_beat_division: DEFAULT_BEAT_DIVISION,
-            selected_clip_id: None,
+            selected_clip_ids: BTreeSet::new(),
             clip_drag: None,
             track_name_edits: BTreeMap::new(),
             snapshot_message: "UI snapshot".to_owned(),
@@ -410,17 +424,22 @@ impl DawApp {
 
     fn render_edit_toolbar(&mut self, ui: &mut egui::Ui) {
         let has_project = self.project.is_some();
+        let selected_count = self.selected_clip_ids.len();
         let selected_summary = self
             .project
             .as_ref()
-            .and_then(|project| selected_clip(project, self.selected_clip_id.as_ref()))
+            .and_then(|project| selected_clip(project, self.primary_selected_clip_id()))
             .map(|clip| {
-                format!(
-                    "Clip {} · start {} · duration {}",
-                    clip.id, clip.start_sample, clip.duration_samples
-                )
+                if selected_count > 1 {
+                    format!("{selected_count} clips selected")
+                } else {
+                    format!(
+                        "Clip {} · start {} · duration {}",
+                        clip.id, clip.start_sample, clip.duration_samples
+                    )
+                }
             });
-        let has_clip = selected_summary.is_some();
+        let has_clip = selected_count > 0;
 
         ui.strong("Edit");
         if ui
@@ -573,7 +592,7 @@ impl DawApp {
                     live_recording.as_ref(),
                     self.timeline_zoom,
                     self.timeline_grid(),
-                    self.selected_clip_id.as_ref(),
+                    &self.selected_clip_ids,
                     self.clip_drag.as_ref(),
                     &self.recording_track_id,
                     &mut self.track_name_edits,
@@ -620,6 +639,7 @@ impl DawApp {
                 self.project_tempo_bpm = project.tempo_bpm;
                 self.project = Some(project);
                 self.clip_drag = None;
+                self.clear_clip_selection();
                 self.status = format!("Created project at {}", path.display());
                 self.reload_auxiliary();
             }
@@ -634,6 +654,7 @@ impl DawApp {
                 self.project_tempo_bpm = project.tempo_bpm;
                 self.project = Some(project);
                 self.clip_drag = None;
+                self.sync_selected_clips();
                 self.status = format!("Opened {}", path.display());
                 self.reload_auxiliary();
             }
@@ -659,6 +680,7 @@ impl DawApp {
         self.project_tempo_bpm = project.tempo_bpm;
         self.project = Some(project);
         self.clip_drag = None;
+        self.sync_selected_clips();
         self.reload_auxiliary();
         Ok(())
     }
@@ -984,26 +1006,29 @@ impl DawApp {
             .map_err(|error| format!("Metronome playback failed: {error}"))
     }
 
-    fn commit_clip_move(&mut self, request: &ClipMoveRequest) {
+    fn commit_clip_moves(&mut self, requests: &[ClipMoveRequest]) {
         let path = PathBuf::from(&self.project_path);
-        match daw_model::set_clip_timing_on_track(
-            &path,
-            &request.clip_id,
-            Some(&request.track_id),
-            request.start_sample,
-            Some(request.source_start_sample),
-            request.duration_samples,
-        ) {
-            Ok(clip) => {
-                let message = format!(
-                    "Moved clip {} to track {} at {}",
-                    clip.id, request.track_id, clip.start_sample
-                );
-                self.set_clip_edit_fields(&clip);
-                self.refresh_project_after_edit(message);
+        let mut moved = Vec::new();
+        for request in requests {
+            match daw_model::set_clip_timing_on_track(
+                &path,
+                &request.clip_id,
+                Some(&request.track_id),
+                request.start_sample,
+                Some(request.source_start_sample),
+                request.duration_samples,
+            ) {
+                Ok(clip) => moved.push(clip),
+                Err(error) => {
+                    self.status = format!("Move clip failed: {error}");
+                    return;
+                }
             }
-            Err(error) => self.status = format!("Move clip failed: {error}"),
         }
+        if let Some(clip) = moved.first() {
+            self.set_clip_edit_fields(clip);
+        }
+        self.refresh_project_after_edit(format!("Moved {} clip(s)", moved.len()));
     }
 
     fn apply_arrangement_action(&mut self, action: &ArrangementAction) {
@@ -1016,26 +1041,15 @@ impl DawApp {
                 source_start_sample,
                 duration_samples,
                 pointer_x,
-            } => {
-                self.selected_clip_id = Some(clip_id.clone());
-                self.edit_clip_id = clip_id.to_string();
-                self.edit_clip_start_sample = start_sample.to_string();
-                self.edit_clip_duration_samples = duration_samples.to_string();
-                self.clip_drag = Some(ActiveClipDrag {
-                    clip_id: clip_id.clone(),
-                    original_track_id: track_id.clone(),
-                    current_track_id: track_id.clone(),
-                    mode: *mode,
-                    original_start_sample: *start_sample,
-                    original_source_start_sample: *source_start_sample,
-                    original_duration_samples: *duration_samples,
-                    duration_samples: *duration_samples,
-                    current_start_sample: *start_sample,
-                    current_source_start_sample: *source_start_sample,
-                    start_pointer_x: *pointer_x,
-                });
-                self.status = format!("Dragging clip {clip_id}");
-            }
+            } => self.begin_clip_drag(
+                clip_id,
+                track_id,
+                *mode,
+                *start_sample,
+                *source_start_sample,
+                *duration_samples,
+                *pointer_x,
+            ),
             ArrangementAction::UpdateClipDrag {
                 track_id,
                 pointer_x,
@@ -1062,14 +1076,27 @@ impl DawApp {
                         || drag.current_track_id != drag.original_track_id
                         || drag.current_source_start_sample != drag.original_source_start_sample
                         || drag.duration_samples != drag.original_duration_samples
+                        || drag.group_members.iter().any(|member| {
+                            member.current_start_sample != member.original_start_sample
+                        })
                     {
-                        self.commit_clip_move(&ClipMoveRequest {
+                        let mut requests = vec![ClipMoveRequest {
                             clip_id: drag.clip_id,
                             track_id: drag.current_track_id,
                             start_sample: drag.current_start_sample,
                             source_start_sample: drag.current_source_start_sample,
                             duration_samples: drag.duration_samples,
-                        });
+                        }];
+                        requests.extend(drag.group_members.into_iter().map(|member| {
+                            ClipMoveRequest {
+                                clip_id: member.clip_id,
+                                track_id: member.track_id,
+                                start_sample: member.current_start_sample,
+                                source_start_sample: member.source_start_sample,
+                                duration_samples: member.duration_samples,
+                            }
+                        }));
+                        self.commit_clip_moves(&requests);
                     }
                 }
             }
@@ -1078,17 +1105,8 @@ impl DawApp {
                 self.recording_start_sample = self.playhead_sample.clone();
                 self.status = format!("Playhead set to {sample}");
             }
-            ArrangementAction::SelectClip(clip_id) => {
-                self.selected_clip_id = Some(clip_id.clone());
-                self.edit_clip_id = clip_id.to_string();
-                if let Some(clip) = self
-                    .project
-                    .as_ref()
-                    .and_then(|project| selected_clip(project, self.selected_clip_id.as_ref()))
-                    .cloned()
-                {
-                    self.set_clip_edit_fields(&clip);
-                }
+            ArrangementAction::SelectClip { clip_id, toggle } => {
+                self.select_clip_from_arrangement(clip_id, *toggle);
             }
             ArrangementAction::ArmTrack(track_id) => {
                 self.recording_track_id = track_id.to_string();
@@ -1104,6 +1122,68 @@ impl DawApp {
                 muted,
                 solo,
             } => self.commit_track_controls(track_id, *volume_percent, *muted, *solo),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_clip_drag(
+        &mut self,
+        clip_id: &daw_model::StableId,
+        track_id: &daw_model::StableId,
+        mode: ClipDragMode,
+        start_sample: u64,
+        source_start_sample: u64,
+        duration_samples: u64,
+        pointer_x: f32,
+    ) {
+        if mode != ClipDragMode::Move || !self.selected_clip_ids.contains(clip_id) {
+            self.select_only_clip(clip_id.clone());
+        }
+        let group_members = if mode == ClipDragMode::Move {
+            self.project
+                .as_ref()
+                .map(|project| selected_clip_locations(project, &self.selected_clip_ids))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|member| member.clip_id != *clip_id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.edit_clip_id = clip_id.to_string();
+        self.edit_clip_start_sample = start_sample.to_string();
+        self.edit_clip_duration_samples = duration_samples.to_string();
+        self.clip_drag = Some(ActiveClipDrag {
+            clip_id: clip_id.clone(),
+            original_track_id: track_id.clone(),
+            current_track_id: track_id.clone(),
+            mode,
+            original_start_sample: start_sample,
+            original_source_start_sample: source_start_sample,
+            original_duration_samples: duration_samples,
+            duration_samples,
+            current_start_sample: start_sample,
+            current_source_start_sample: source_start_sample,
+            start_pointer_x: pointer_x,
+            group_members,
+        });
+        self.status = format!("Dragging clip {clip_id}");
+    }
+
+    fn select_clip_from_arrangement(&mut self, clip_id: &daw_model::StableId, toggle: bool) {
+        if toggle {
+            self.toggle_clip_selection(clip_id.clone());
+        } else {
+            self.select_only_clip(clip_id.clone());
+        }
+        self.edit_clip_id = clip_id.to_string();
+        if let Some(clip) = self
+            .project
+            .as_ref()
+            .and_then(|project| selected_clip(project, Some(clip_id)))
+            .cloned()
+        {
+            self.set_clip_edit_fields(&clip);
         }
     }
 
@@ -1160,6 +1240,35 @@ impl DawApp {
         }
     }
 
+    fn sync_selected_clips(&mut self) {
+        let Some(project) = &self.project else {
+            self.selected_clip_ids.clear();
+            return;
+        };
+        self.selected_clip_ids
+            .retain(|clip_id| selected_clip(project, Some(clip_id)).is_some());
+    }
+
+    fn primary_selected_clip_id(&self) -> Option<&daw_model::StableId> {
+        self.selected_clip_ids.iter().next()
+    }
+
+    fn select_only_clip(&mut self, clip_id: daw_model::StableId) {
+        self.selected_clip_ids.clear();
+        self.selected_clip_ids.insert(clip_id);
+    }
+
+    fn toggle_clip_selection(&mut self, clip_id: daw_model::StableId) {
+        if !self.selected_clip_ids.remove(&clip_id) {
+            self.selected_clip_ids.insert(clip_id);
+        }
+    }
+
+    fn clear_clip_selection(&mut self) {
+        self.selected_clip_ids.clear();
+        self.edit_clip_id.clear();
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if self.clip_drag.is_some() {
             return;
@@ -1185,7 +1294,7 @@ impl DawApp {
                 && !input.modifiers.ctrl
                 && input.key_pressed(egui::Key::S)
         });
-        if split_pressed && !ctx.wants_keyboard_input() && self.selected_clip_id.is_some() {
+        if split_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
             self.split_selected_clip();
             return;
         }
@@ -1196,7 +1305,7 @@ impl DawApp {
                 && !input.modifiers.ctrl
                 && input.key_pressed(egui::Key::D)
         });
-        if duplicate_pressed && !ctx.wants_keyboard_input() && self.selected_clip_id.is_some() {
+        if duplicate_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
             self.duplicate_selected_clip();
             return;
         }
@@ -1215,7 +1324,7 @@ impl DawApp {
         let delete_pressed = ctx.input(|input| {
             input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
         });
-        if delete_pressed && !ctx.wants_keyboard_input() && self.selected_clip_id.is_some() {
+        if delete_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
             self.remove_selected_clip();
         }
     }
@@ -1223,6 +1332,7 @@ impl DawApp {
     fn use_first_clip(&mut self) {
         let clip = self.project.as_ref().and_then(first_project_clip).cloned();
         if let Some(clip) = clip {
+            self.select_only_clip(clip.id.clone());
             self.set_clip_edit_fields(&clip);
             "Selected first clip".clone_into(&mut self.status);
         } else if self.project.is_some() {
@@ -1280,9 +1390,7 @@ impl DawApp {
         ) {
             Ok(clip) => {
                 self.edit_clip_id.clear();
-                if self.selected_clip_id.as_ref() == Some(&clip.id) {
-                    self.selected_clip_id = None;
-                }
+                self.selected_clip_ids.remove(&clip.id);
                 self.refresh_project_after_edit(format!("Removed clip {}", clip.id));
             }
             Err(error) => self.status = format!("Remove clip failed: {error}"),
@@ -1290,27 +1398,31 @@ impl DawApp {
     }
 
     fn remove_selected_clip(&mut self) {
-        let Some(clip_id) = self.selected_clip_id.clone() else {
+        if self.selected_clip_ids.is_empty() {
             "No clip selected".clone_into(&mut self.status);
             return;
-        };
-        let path = PathBuf::from(&self.project_path);
-        match daw_model::remove_clip(&path, &clip_id) {
-            Ok(clip) => {
-                self.selected_clip_id = None;
-                self.edit_clip_id.clear();
-                self.refresh_project_after_edit(format!("Removed clip {}", clip.id));
-            }
-            Err(error) => self.status = format!("Remove clip failed: {error}"),
         }
+        let clip_ids = self.selected_clip_ids.iter().cloned().collect::<Vec<_>>();
+        let path = PathBuf::from(&self.project_path);
+        let mut removed = Vec::new();
+        for clip_id in &clip_ids {
+            match daw_model::remove_clip(&path, clip_id) {
+                Ok(clip) => removed.push(clip.id),
+                Err(error) => {
+                    self.status = format!("Remove clip failed: {error}");
+                    return;
+                }
+            }
+        }
+        self.clear_clip_selection();
+        self.refresh_project_after_edit(format!("Removed {} clip(s)", removed.len()));
     }
 
     fn undo_project_edit(&mut self) {
         let path = PathBuf::from(&self.project_path);
         match daw_model::undo_project(&path) {
             Ok(_) => {
-                self.selected_clip_id = None;
-                self.edit_clip_id.clear();
+                self.clear_clip_selection();
                 self.refresh_project_after_edit("Undo complete");
             }
             Err(error) => self.status = format!("Undo failed: {error}"),
@@ -1321,8 +1433,7 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::redo_project(&path) {
             Ok(_) => {
-                self.selected_clip_id = None;
-                self.edit_clip_id.clear();
+                self.clear_clip_selection();
                 self.refresh_project_after_edit("Redo complete");
             }
             Err(error) => self.status = format!("Redo failed: {error}"),
@@ -1330,7 +1441,7 @@ impl DawApp {
     }
 
     fn split_selected_clip(&mut self) {
-        let Some(clip_id) = self.selected_clip_id.clone() else {
+        let Some(clip_id) = self.primary_selected_clip_id().cloned() else {
             "No clip selected".clone_into(&mut self.status);
             return;
         };
@@ -1344,7 +1455,7 @@ impl DawApp {
         let path = PathBuf::from(&self.project_path);
         match daw_model::split_clip(&path, &clip_id, split_sample) {
             Ok((left, right)) => {
-                self.selected_clip_id = Some(right.id.clone());
+                self.select_only_clip(right.id.clone());
                 self.set_clip_edit_fields(&right);
                 self.refresh_project_after_edit(format!(
                     "Split clip {} at {} into {} and {}",
@@ -1356,10 +1467,10 @@ impl DawApp {
     }
 
     fn duplicate_selected_clip(&mut self) {
-        let Some(clip_id) = self.selected_clip_id.clone() else {
+        if self.selected_clip_ids.is_empty() {
             "No clip selected".clone_into(&mut self.status);
             return;
-        };
+        }
         let start_sample = match parse_u64(&self.playhead_sample, "playhead") {
             Ok(value) => value,
             Err(error) => {
@@ -1368,17 +1479,34 @@ impl DawApp {
             }
         };
         let path = PathBuf::from(&self.project_path);
-        match daw_model::duplicate_clip(&path, &clip_id, None, start_sample) {
-            Ok(clip) => {
-                self.selected_clip_id = Some(clip.id.clone());
-                self.set_clip_edit_fields(&clip);
-                self.refresh_project_after_edit(format!(
-                    "Duplicated clip {} to {}",
-                    clip.id, clip.start_sample
-                ));
+        let Some(project) = &self.project else {
+            "Open a project before duplicating clips".clone_into(&mut self.status);
+            return;
+        };
+        let selected_clips = selected_clips(project, &self.selected_clip_ids)
+            .into_iter()
+            .map(|clip| (clip.id.clone(), clip.start_sample))
+            .collect::<Vec<_>>();
+        let Some(earliest_start) = selected_clips.iter().map(|(_, start)| *start).min() else {
+            "No selected clips found".clone_into(&mut self.status);
+            return;
+        };
+        let mut duplicated = Vec::new();
+        for (clip_id, clip_start) in selected_clips {
+            let duplicate_start = start_sample.saturating_add(clip_start - earliest_start);
+            match daw_model::duplicate_clip(&path, &clip_id, None, duplicate_start) {
+                Ok(clip) => duplicated.push(clip),
+                Err(error) => {
+                    self.status = format!("Duplicate clip failed: {error}");
+                    return;
+                }
             }
-            Err(error) => self.status = format!("Duplicate clip failed: {error}"),
         }
+        self.selected_clip_ids = duplicated.iter().map(|clip| clip.id.clone()).collect();
+        if let Some(clip) = duplicated.first() {
+            self.set_clip_edit_fields(clip);
+        }
+        self.refresh_project_after_edit(format!("Duplicated {} clip(s)", duplicated.len()));
     }
 
     fn remove_track(&mut self, track_id: &daw_model::StableId) {
@@ -1388,8 +1516,7 @@ impl DawApp {
                 if self.recording_track_id == track.id.to_string() {
                     self.recording_track_id.clear();
                 }
-                self.selected_clip_id = None;
-                self.edit_clip_id.clear();
+                self.clear_clip_selection();
                 self.track_name_edits.remove(&track.id.to_string());
                 self.refresh_project_after_edit(format!("Removed track '{}'", track.name));
             }
@@ -1492,7 +1619,7 @@ fn render_arrangement(
     live_recording: Option<&LiveRecordingPreview>,
     timeline_zoom: f32,
     timeline_grid: TimelineGrid,
-    selected_clip_id: Option<&daw_model::StableId>,
+    selected_clip_ids: &BTreeSet<daw_model::StableId>,
     active_clip_drag: Option<&ActiveClipDrag>,
     recording_track_id: &str,
     track_name_edits: &mut BTreeMap<String, String>,
@@ -1534,7 +1661,7 @@ fn render_arrangement(
                     playhead,
                     timeline_grid,
                     live_recording,
-                    selected_clip_id,
+                    selected_clip_ids,
                     active_clip_drag,
                     recording_track_id,
                     track_name_edits,
@@ -1632,7 +1759,7 @@ fn render_track_lane(
     playhead: u64,
     timeline_grid: TimelineGrid,
     live_recording: Option<&LiveRecordingPreview>,
-    selected_clip_id: Option<&daw_model::StableId>,
+    selected_clip_ids: &BTreeSet<daw_model::StableId>,
     active_clip_drag: Option<&ActiveClipDrag>,
     recording_track_id: &str,
     track_name_edits: &mut BTreeMap<String, String>,
@@ -1668,7 +1795,13 @@ fn render_track_lane(
 
     let mut clip_rects = Vec::new();
     for clip in &track.clips {
-        if active_clip_drag.is_some_and(|drag| drag.clip_id == clip.id) {
+        if active_clip_drag.is_some_and(|drag| {
+            drag.clip_id == clip.id
+                || drag
+                    .group_members
+                    .iter()
+                    .any(|member| member.clip_id == clip.id)
+        }) {
             clip_rects.push(clip_rect(
                 lane_rect,
                 clip.start_sample,
@@ -1687,7 +1820,7 @@ fn render_track_lane(
             clip,
             timeline_samples,
             timeline_grid.snap,
-            selected_clip_id,
+            selected_clip_ids,
             active_clip_drag,
         );
         clip_rects.push(result.rect);
@@ -1719,18 +1852,17 @@ fn render_track_lane(
         ) {
             actions.push(action);
         }
-        if drag.current_track_id == track.id {
-            render_active_clip_drag(
-                &painter,
-                project,
-                media_objects,
-                waveforms,
-                lane_rect,
-                drag,
-                timeline_samples,
-                selected_clip_id,
-            );
-        }
+        render_active_clip_drag_previews(
+            &painter,
+            project,
+            media_objects,
+            waveforms,
+            lane_rect,
+            track,
+            drag,
+            timeline_samples,
+            selected_clip_ids,
+        );
     }
 
     if let Some(live_recording) = live_recording.filter(|preview| preview.track_id == track.id) {
@@ -2004,6 +2136,12 @@ fn update_active_clip_drag_timing(
             );
             drag.current_source_start_sample = drag.original_source_start_sample;
             drag.duration_samples = drag.original_duration_samples;
+            for member in &mut drag.group_members {
+                member.current_start_sample = snap_sample(
+                    apply_sample_delta(member.original_start_sample, delta_samples),
+                    snap_grid_samples,
+                );
+            }
         }
         ClipDragMode::TrimStart => {
             let original_end = drag
@@ -2120,6 +2258,48 @@ fn draw_clip_body(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn render_active_clip_drag_previews(
+    painter: &egui::Painter,
+    project: &daw_model::Project,
+    media_objects: &[daw_media::MediaObject],
+    waveforms: &[daw_media::WaveformSummary],
+    lane_rect: egui::Rect,
+    track: &daw_model::Track,
+    drag: &ActiveClipDrag,
+    timeline_samples: u64,
+    selected_clip_ids: &BTreeSet<daw_model::StableId>,
+) {
+    if drag.current_track_id == track.id {
+        render_active_clip_drag(
+            painter,
+            project,
+            media_objects,
+            waveforms,
+            lane_rect,
+            drag,
+            timeline_samples,
+            selected_clip_ids,
+        );
+    }
+    for member in drag
+        .group_members
+        .iter()
+        .filter(|member| member.track_id == track.id)
+    {
+        render_active_clip_drag_member(
+            painter,
+            project,
+            media_objects,
+            waveforms,
+            lane_rect,
+            member,
+            timeline_samples,
+            selected_clip_ids,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_active_clip_drag(
     painter: &egui::Painter,
     project: &daw_model::Project,
@@ -2128,7 +2308,7 @@ fn render_active_clip_drag(
     lane_rect: egui::Rect,
     drag: &ActiveClipDrag,
     timeline_samples: u64,
-    selected_clip_id: Option<&daw_model::StableId>,
+    selected_clip_ids: &BTreeSet<daw_model::StableId>,
 ) {
     let Some(clip) = selected_clip(project, Some(&drag.clip_id)) else {
         return;
@@ -2146,7 +2326,39 @@ fn render_active_clip_drag(
         waveforms,
         clip,
         rect,
-        selected_clip_id == Some(&drag.clip_id),
+        selected_clip_ids.contains(&drag.clip_id),
+        true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_active_clip_drag_member(
+    painter: &egui::Painter,
+    project: &daw_model::Project,
+    media_objects: &[daw_media::MediaObject],
+    waveforms: &[daw_media::WaveformSummary],
+    lane_rect: egui::Rect,
+    member: &ActiveClipDragMember,
+    timeline_samples: u64,
+    selected_clip_ids: &BTreeSet<daw_model::StableId>,
+) {
+    let Some(clip) = selected_clip(project, Some(&member.clip_id)) else {
+        return;
+    };
+    let rect = clip_rect(
+        lane_rect,
+        member.current_start_sample,
+        member.duration_samples,
+        timeline_samples,
+    );
+    draw_clip_body(
+        painter,
+        project,
+        media_objects,
+        waveforms,
+        clip,
+        rect,
+        selected_clip_ids.contains(&member.clip_id),
         true,
     );
 }
@@ -2166,7 +2378,7 @@ fn render_clip(
     clip: &daw_model::Clip,
     timeline_samples: u64,
     snap_grid_samples: Option<u64>,
-    selected_clip_id: Option<&daw_model::StableId>,
+    selected_clip_ids: &BTreeSet<daw_model::StableId>,
     active_clip_drag: Option<&ActiveClipDrag>,
 ) -> ClipRenderResult {
     let painter = ui.painter_at(lane_rect);
@@ -2181,7 +2393,7 @@ fn render_clip(
         egui::Id::new(("clip", clip.id.to_string())),
         egui::Sense::click_and_drag(),
     );
-    let selected = selected_clip_id == Some(&clip.id);
+    let selected = selected_clip_ids.contains(&clip.id);
     let this_clip_drag = active_clip_drag.filter(|drag| drag.clip_id == clip.id);
     let draw_rect = if let Some(drag) = this_clip_drag {
         clip_rect(
@@ -2257,7 +2469,7 @@ fn render_clip(
         egui::Sense::click_and_drag(),
     );
 
-    if active_clip_drag.is_none() && left_handle_response.is_pointer_button_down_on() {
+    if active_clip_drag.is_none() && left_handle_response.drag_started() {
         if let Some(position) = left_handle_response.interact_pointer_pos() {
             return ClipRenderResult {
                 rect: base_clip_rect,
@@ -2274,7 +2486,7 @@ fn render_clip(
         }
     }
 
-    if active_clip_drag.is_none() && right_handle_response.is_pointer_button_down_on() {
+    if active_clip_drag.is_none() && right_handle_response.drag_started() {
         if let Some(position) = right_handle_response.interact_pointer_pos() {
             return ClipRenderResult {
                 rect: base_clip_rect,
@@ -2291,7 +2503,7 @@ fn render_clip(
         }
     }
 
-    if active_clip_drag.is_none() && response.is_pointer_button_down_on() {
+    if active_clip_drag.is_none() && response.drag_started() {
         if let Some(position) = response.interact_pointer_pos() {
             return ClipRenderResult {
                 rect: base_clip_rect,
@@ -2309,9 +2521,13 @@ fn render_clip(
     }
 
     if response.clicked() {
+        let toggle = ui.input(|input| input.modifiers.command);
         return ClipRenderResult {
             rect: base_clip_rect,
-            action: Some(ArrangementAction::SelectClip(clip.id.clone())),
+            action: Some(ArrangementAction::SelectClip {
+                clip_id: clip.id.clone(),
+                toggle,
+            }),
         };
     }
 
@@ -2535,6 +2751,42 @@ fn selected_clip<'a>(
         .iter()
         .flat_map(|track| &track.clips)
         .find(|clip| &clip.id == clip_id)
+}
+
+fn selected_clips<'a>(
+    project: &'a daw_model::Project,
+    clip_ids: &BTreeSet<daw_model::StableId>,
+) -> Vec<&'a daw_model::Clip> {
+    project
+        .tracks
+        .iter()
+        .flat_map(|track| &track.clips)
+        .filter(|clip| clip_ids.contains(&clip.id))
+        .collect()
+}
+
+fn selected_clip_locations(
+    project: &daw_model::Project,
+    clip_ids: &BTreeSet<daw_model::StableId>,
+) -> Vec<ActiveClipDragMember> {
+    project
+        .tracks
+        .iter()
+        .flat_map(|track| {
+            track
+                .clips
+                .iter()
+                .filter(|clip| clip_ids.contains(&clip.id))
+                .map(|clip| ActiveClipDragMember {
+                    clip_id: clip.id.clone(),
+                    track_id: track.id.clone(),
+                    original_start_sample: clip.start_sample,
+                    current_start_sample: clip.start_sample,
+                    source_start_sample: clip.source_start_sample,
+                    duration_samples: clip.duration_samples,
+                })
+        })
+        .collect()
 }
 
 fn render_project_buffer(
