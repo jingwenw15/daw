@@ -32,6 +32,8 @@ platform is macOS, with the architecture kept portable where practical.
 - Clip selection, deletion, command-log-backed placement edits, horizontal
   timeline dragging, trim handles, split-at-playhead editing, and clip
   duplication.
+- Non-destructive clip fade-in/fade-out metadata applied during playback and
+  render.
 - Visible edit toolbar with shortcuts for common timeline clip actions.
 - Multi-select clip editing with Cmd-click selection, bulk delete, bulk
   duplicate, and grouped horizontal dragging.

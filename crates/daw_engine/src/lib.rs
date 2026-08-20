@@ -547,6 +547,47 @@ pub fn mix_clip(
     }
 }
 
+/// Apply non-destructive linear clip fade ramps to an audio buffer segment.
+pub fn apply_clip_fades(
+    buffer: &mut AudioBuffer,
+    clip_offset_frames: u64,
+    clip_duration_frames: u64,
+    fade_in_frames: u64,
+    fade_out_frames: u64,
+) {
+    if buffer.samples.is_empty() || buffer.channels == 0 {
+        return;
+    }
+    let channels = usize::from(buffer.channels);
+    for frame in 0..buffer.frames() {
+        let Ok(frame_u64) = u64::try_from(frame) else {
+            break;
+        };
+        let clip_position = clip_offset_frames.saturating_add(frame_u64);
+        let mut gain = 1.0_f32;
+        if fade_in_frames > 0 && clip_position < fade_in_frames {
+            gain = gain.min(fade_ratio(clip_position, fade_in_frames));
+        }
+        if fade_out_frames > 0 && clip_position < clip_duration_frames {
+            let remaining = clip_duration_frames - clip_position;
+            if remaining < fade_out_frames {
+                gain = gain.min(fade_ratio(remaining, fade_out_frames));
+            }
+        }
+        if gain >= 1.0 {
+            continue;
+        }
+        for channel in 0..channels {
+            buffer.samples[frame * channels + channel] *= gain;
+        }
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn fade_ratio(numerator: u64, denominator: u64) -> f32 {
+    numerator as f32 / denominator as f32
+}
+
 /// Convert an audio buffer to a different channel count.
 #[must_use]
 pub fn convert_channels(buffer: &AudioBuffer, channels: u16) -> AudioBuffer {
@@ -1151,8 +1192,8 @@ fn parse_pcm16_wav(bytes: &[u8]) -> Result<AudioBuffer, RenderError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        convert_channels, mix_clip, read_wav, render_metronome, render_silence, render_sine,
-        slice_frames, write_wav, AudioBuffer, DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE,
+        apply_clip_fades, convert_channels, mix_clip, read_wav, render_metronome, render_silence,
+        render_sine, slice_frames, write_wav, AudioBuffer, DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE,
     };
     use std::{fs, path::PathBuf};
 
@@ -1229,6 +1270,24 @@ mod tests {
         assert_eq!(decoded.frames(), clip.frames());
         assert!(destination.samples.iter().any(|sample| sample.abs() > 0.0));
         fs::remove_file(output).expect("cleanup");
+    }
+
+    #[test]
+    fn applies_clip_fades_to_buffer_frames() {
+        let mut buffer = AudioBuffer {
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            channels: 1,
+            samples: vec![1.0; 6],
+        };
+
+        apply_clip_fades(&mut buffer, 0, 6, 3, 3);
+
+        assert!(buffer.samples[0].abs() < f32::EPSILON);
+        assert!((buffer.samples[1] - (1.0 / 3.0)).abs() < f32::EPSILON);
+        assert!((buffer.samples[2] - (2.0 / 3.0)).abs() < f32::EPSILON);
+        assert!((buffer.samples[3] - 1.0).abs() < f32::EPSILON);
+        assert!((buffer.samples[4] - (2.0 / 3.0)).abs() < f32::EPSILON);
+        assert!((buffer.samples[5] - (1.0 / 3.0)).abs() < f32::EPSILON);
     }
 
     #[test]

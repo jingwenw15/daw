@@ -486,3 +486,17 @@ playback runs.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 40
+
+Clips have non-destructive fade-in and fade-out durations stored in the project
+model and replayed through the command log. CLI and native playback/render paths
+apply linear fade ramps before mixing clips, and the advanced clip panel can set
+fade durations for the selected clip. Splitting clips keeps only the relevant
+outer edge fades.
+
+```sh
+cargo run --bin daw -- clip fade /tmp/my-session <clip-id> <fade-in-samples> <fade-out-samples>
+cargo test
+cargo run --bin daw-ui
+```

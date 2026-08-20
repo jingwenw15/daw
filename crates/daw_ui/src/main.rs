@@ -39,6 +39,8 @@ struct DawApp {
     edit_clip_id: String,
     edit_clip_start_sample: String,
     edit_clip_duration_samples: String,
+    edit_clip_fade_in_samples: String,
+    edit_clip_fade_out_samples: String,
     recording_track_id: String,
     recording_start_sample: String,
     mixer_track_id: String,
@@ -223,6 +225,8 @@ impl Default for DawApp {
             edit_clip_id: String::new(),
             edit_clip_start_sample: "0".to_owned(),
             edit_clip_duration_samples: "48000".to_owned(),
+            edit_clip_fade_in_samples: "0".to_owned(),
+            edit_clip_fade_out_samples: "0".to_owned(),
             recording_track_id: String::new(),
             recording_start_sample: "0".to_owned(),
             mixer_track_id: String::new(),
@@ -566,11 +570,20 @@ impl DawApp {
             ui.text_edit_singleline(&mut self.edit_clip_duration_samples);
         });
         ui.horizontal(|ui| {
+            ui.label("Fade In");
+            ui.text_edit_singleline(&mut self.edit_clip_fade_in_samples);
+            ui.label("Fade Out");
+            ui.text_edit_singleline(&mut self.edit_clip_fade_out_samples);
+        });
+        ui.horizontal(|ui| {
             if ui.button("Use First Clip").clicked() {
                 self.use_first_clip();
             }
             if ui.button("Move Clip").clicked() {
                 self.move_clip();
+            }
+            if ui.button("Set Fades").clicked() {
+                self.set_clip_fades();
             }
             if ui.button("Remove Clip").clicked() {
                 self.remove_clip();
@@ -1375,6 +1388,8 @@ impl DawApp {
         self.edit_clip_id = clip.id.to_string();
         self.edit_clip_start_sample = clip.start_sample.to_string();
         self.edit_clip_duration_samples = clip.duration_samples.to_string();
+        self.edit_clip_fade_in_samples = clip.fade_in_samples.to_string();
+        self.edit_clip_fade_out_samples = clip.fade_out_samples.to_string();
     }
 
     fn move_clip(&mut self) {
@@ -1408,6 +1423,39 @@ impl DawApp {
                 self.refresh_project_after_edit(message);
             }
             Err(error) => self.status = format!("Move clip failed: {error}"),
+        }
+    }
+
+    fn set_clip_fades(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        let fade_in_samples = match parse_u64(&self.edit_clip_fade_in_samples, "clip fade in") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let fade_out_samples = match parse_u64(&self.edit_clip_fade_out_samples, "clip fade out") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        match daw_model::set_clip_fades(
+            &path,
+            &daw_model::StableId::from_string(self.edit_clip_id.clone()),
+            fade_in_samples,
+            fade_out_samples,
+        ) {
+            Ok(clip) => {
+                self.set_clip_edit_fields(&clip);
+                self.refresh_project_after_edit(format!(
+                    "Set clip {} fades in={} out={}",
+                    clip.id, clip.fade_in_samples, clip.fade_out_samples
+                ));
+            }
+            Err(error) => self.status = format!("Set clip fades failed: {error}"),
         }
     }
 
@@ -3038,7 +3086,17 @@ fn mix_clip_from_project(
     let remaining_clip_frames =
         usize::try_from(clip_end - render_start_sample.max(clip.start_sample))
             .map_err(|_| "Clip duration is too large".to_owned())?;
-    let limited = slice_buffer_frames(&decoded, source_start, remaining_clip_frames);
+    let mut limited = slice_buffer_frames(&decoded, source_start, remaining_clip_frames);
+    let clip_offset = render_start_sample
+        .max(clip.start_sample)
+        .saturating_sub(clip.start_sample);
+    daw_engine::apply_clip_fades(
+        &mut limited,
+        clip_offset,
+        clip.duration_samples,
+        clip.fade_in_samples,
+        clip.fade_out_samples,
+    );
     daw_engine::mix_clip(
         output,
         &limited,

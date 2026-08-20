@@ -459,6 +459,7 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("fade") => run_clip_fade(args),
         Some("remove") => {
             let project = required_arg(&mut args, "path")?;
             let clip_id = required_arg(&mut args, "clip-id")?;
@@ -476,6 +477,26 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         )),
         None => Err("missing clip command\nrun `daw --help` for usage".to_owned()),
     }
+}
+
+fn run_clip_fade(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let project = required_arg(&mut args, "path")?;
+    let clip_id = required_arg(&mut args, "clip-id")?;
+    let fade_in_samples = required_u64(&mut args, "fade-in-samples")?;
+    let fade_out_samples = required_u64(&mut args, "fade-out-samples")?;
+    no_extra_args(args)?;
+    let clip = daw_model::set_clip_fades(
+        project.as_ref(),
+        &daw_model::StableId::from_string(clip_id),
+        fade_in_samples,
+        fade_out_samples,
+    )
+    .map_err(|error| format!("failed to set clip fades: {error}"))?;
+    println!(
+        "set clip {} fades in={} out={}",
+        clip.id, clip.fade_in_samples, clip.fade_out_samples
+    );
+    Ok(())
 }
 
 fn run_project(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -836,7 +857,17 @@ fn render_project_buffer(
             let remaining_clip_frames =
                 usize::try_from(clip_end - start_sample.max(clip.start_sample))
                     .map_err(|_| "clip duration is too large".to_owned())?;
-            let limited = slice_buffer_frames(&decoded, source_start, remaining_clip_frames);
+            let mut limited = slice_buffer_frames(&decoded, source_start, remaining_clip_frames);
+            let clip_offset = start_sample
+                .max(clip.start_sample)
+                .saturating_sub(clip.start_sample);
+            daw_engine::apply_clip_fades(
+                &mut limited,
+                clip_offset,
+                clip.duration_samples,
+                clip.fade_in_samples,
+                clip.fade_out_samples,
+            );
             daw_engine::mix_clip(
                 &mut output,
                 &limited,
@@ -874,6 +905,7 @@ fn print_help() {
     println!("  daw clip move <path> <clip-id> <start-sample> <duration-samples>");
     println!("  daw clip split <path> <clip-id> <split-sample>");
     println!("  daw clip duplicate <path> <clip-id> <start-sample> [track-id]");
+    println!("  daw clip fade <path> <clip-id> <fade-in-samples> <fade-out-samples>");
     println!("  daw clip remove <path> <clip-id>");
     println!("  daw snapshot create <path> [message]");
     println!("  daw branch create <path> <name>");

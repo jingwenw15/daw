@@ -90,6 +90,12 @@ pub struct Clip {
     pub source_start_sample: u64,
     /// Clip duration in samples.
     pub duration_samples: u64,
+    /// Fade-in duration in samples.
+    #[serde(default)]
+    pub fade_in_samples: u64,
+    /// Fade-out duration in samples.
+    #[serde(default)]
+    pub fade_out_samples: u64,
 }
 
 /// A media object referenced by the project.
@@ -170,6 +176,15 @@ pub enum ProjectCommand {
         split_sample: u64,
         /// Stable ID assigned to the new right-side clip.
         new_clip_id: StableId,
+    },
+    /// Set non-destructive clip fade durations.
+    SetClipFades {
+        /// Clip receiving the fade settings.
+        clip_id: StableId,
+        /// Fade-in duration in samples.
+        fade_in_samples: u64,
+        /// Fade-out duration in samples.
+        fade_out_samples: u64,
     },
     /// Remove an existing clip from its track.
     RemoveClip {
@@ -352,6 +367,18 @@ impl Project {
                         clip.id
                     )));
                 }
+                if clip.fade_in_samples > clip.duration_samples {
+                    errors.push(ValidationError::new(format!(
+                        "clip {} fade_in_samples must not exceed duration_samples",
+                        clip.id
+                    )));
+                }
+                if clip.fade_out_samples > clip.duration_samples {
+                    errors.push(ValidationError::new(format!(
+                        "clip {} fade_out_samples must not exceed duration_samples",
+                        clip.id
+                    )));
+                }
                 if !self.media.iter().any(|media| media.id == clip.media_id) {
                     errors.push(ValidationError::new(format!(
                         "clip {} references unknown media {}",
@@ -485,6 +512,13 @@ impl ProjectCommand {
                 split_sample,
                 new_clip_id,
             } => format!("split clip {clip_id} at {split_sample} into {new_clip_id}"),
+            Self::SetClipFades {
+                clip_id,
+                fade_in_samples,
+                fade_out_samples,
+            } => {
+                format!("set clip {clip_id} fades in={fade_in_samples} out={fade_out_samples}")
+            }
             Self::RemoveClip { clip_id } => format!("remove clip {clip_id}"),
             Self::SetTrackControls {
                 track_id,
@@ -834,6 +868,8 @@ pub fn add_clip(
         start_sample,
         source_start_sample: 0,
         duration_samples,
+        fade_in_samples: 0,
+        fade_out_samples: 0,
     };
     append_and_apply(
         project_dir,
@@ -945,6 +981,32 @@ pub fn split_clip(
     Ok((left, right))
 }
 
+/// Set non-destructive fade durations on an existing clip.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the clip is unknown, fades
+/// are invalid for the clip duration, or the updated project cannot be saved.
+pub fn set_clip_fades(
+    project_dir: &Path,
+    clip_id: &StableId,
+    fade_in_samples: u64,
+    fade_out_samples: u64,
+) -> Result<Clip, ProjectIoError> {
+    append_and_apply(
+        project_dir,
+        ProjectCommand::SetClipFades {
+            clip_id: clip_id.clone(),
+            fade_in_samples,
+            fade_out_samples,
+        },
+    )?;
+    let project = load_project(project_dir)?;
+    find_clip(&project, clip_id)
+        .cloned()
+        .ok_or_else(|| unknown_clip_error(clip_id))
+}
+
 /// Duplicate an existing clip at a new timeline start, optionally on another track.
 ///
 /// # Errors
@@ -972,6 +1034,8 @@ pub fn duplicate_clip(
         start_sample,
         source_start_sample: source.source_start_sample,
         duration_samples: source.duration_samples,
+        fade_in_samples: source.fade_in_samples,
+        fade_out_samples: source.fade_out_samples,
     };
     append_and_apply(
         project_dir,
@@ -1391,6 +1455,11 @@ fn apply_command(
             split_sample,
             new_clip_id,
         } => apply_split_clip(project, clip_id, *split_sample, new_clip_id),
+        ProjectCommand::SetClipFades {
+            clip_id,
+            fade_in_samples,
+            fade_out_samples,
+        } => apply_set_clip_fades(project, clip_id, *fade_in_samples, *fade_out_samples),
         ProjectCommand::RemoveClip { clip_id } => apply_remove_clip(project, clip_id),
         ProjectCommand::SetTrackControls {
             track_id,
@@ -1475,15 +1544,32 @@ fn apply_split_clip(
     let left_duration = split_sample - clip.start_sample;
     let right_duration = clip_end - split_sample;
     project.tracks[track_index].clips[clip_index].duration_samples = left_duration;
+    project.tracks[track_index].clips[clip_index].fade_in_samples =
+        clip.fade_in_samples.min(left_duration);
+    project.tracks[track_index].clips[clip_index].fade_out_samples = 0;
     let right = Clip {
         id: new_clip_id.clone(),
         media_id: clip.media_id,
         start_sample: split_sample,
         source_start_sample: clip.source_start_sample.saturating_add(left_duration),
         duration_samples: right_duration,
+        fade_in_samples: 0,
+        fade_out_samples: clip.fade_out_samples.min(right_duration),
     };
     project.tracks[track_index].clips.push(right);
     sort_track_clips(&mut project);
+    validate_project_state(project)
+}
+
+fn apply_set_clip_fades(
+    mut project: Project,
+    clip_id: &StableId,
+    fade_in_samples: u64,
+    fade_out_samples: u64,
+) -> Result<Project, ProjectIoError> {
+    let clip = find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?;
+    clip.fade_in_samples = fade_in_samples;
+    clip.fade_out_samples = fade_out_samples;
     validate_project_state(project)
 }
 
@@ -1796,7 +1882,7 @@ mod tests {
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, duplicate_clip, init_project, list_branches, load_project,
         merge_branch, project_file_path, redo_project, remove_clip, remove_track, replay_project,
-        set_clip_placement, set_clip_placement_on_track, set_clip_timing_on_track,
+        set_clip_fades, set_clip_placement, set_clip_placement_on_track, set_clip_timing_on_track,
         set_project_tempo, set_track_controls, set_track_name, split_clip, switch_branch,
         undo_project, Project, ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM,
         PROJECT_SCHEMA_VERSION,
@@ -2085,6 +2171,42 @@ mod tests {
         assert_eq!(project.tracks[0].clips, vec![trimmed]);
         assert_eq!(replayed, project);
 
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn sets_clip_fades_through_command_log() {
+        let project_dir = temp_project_dir("clip-fades");
+        init_project(&project_dir, "Clip Fades").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+
+        let faded = set_clip_fades(&project_dir, &clip.id, 2_400, 4_800).expect("set fades");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(faded.fade_in_samples, 2_400);
+        assert_eq!(faded.fade_out_samples, 4_800);
+        assert_eq!(project.tracks[0].clips, vec![faded]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn rejects_clip_fades_longer_than_duration() {
+        let project_dir = temp_project_dir("clip-fade-invalid");
+        init_project(&project_dir, "Clip Fade Invalid").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+
+        let result = set_clip_fades(&project_dir, &clip.id, 24_001, 0);
+
+        assert!(matches!(result, Err(ProjectIoError::Invalid(_))));
         fs::remove_dir_all(project_dir).expect("cleanup project");
     }
 
