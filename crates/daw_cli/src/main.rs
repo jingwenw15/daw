@@ -460,6 +460,7 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             Ok(())
         }
         Some("fade") => run_clip_fade(args),
+        Some("gain") => run_clip_gain(args),
         Some("remove") => {
             let project = required_arg(&mut args, "path")?;
             let clip_id = required_arg(&mut args, "clip-id")?;
@@ -496,6 +497,21 @@ fn run_clip_fade(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         "set clip {} fades in={} out={}",
         clip.id, clip.fade_in_samples, clip.fade_out_samples
     );
+    Ok(())
+}
+
+fn run_clip_gain(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let project = required_arg(&mut args, "path")?;
+    let clip_id = required_arg(&mut args, "clip-id")?;
+    let gain_percent = required_u16(&mut args, "gain-percent")?;
+    no_extra_args(args)?;
+    let clip = daw_model::set_clip_gain(
+        project.as_ref(),
+        &daw_model::StableId::from_string(clip_id),
+        gain_percent,
+    )
+    .map_err(|error| format!("failed to set clip gain: {error}"))?;
+    println!("set clip {} gain={}", clip.id, clip.gain_percent);
     Ok(())
 }
 
@@ -872,7 +888,7 @@ fn render_project_buffer(
                 &mut output,
                 &limited,
                 destination_start,
-                track.volume_percent,
+                combined_gain_percent(track.volume_percent, clip.gain_percent),
                 track.muted,
             );
         }
@@ -887,6 +903,11 @@ fn slice_buffer_frames(
     frames: usize,
 ) -> daw_engine::AudioBuffer {
     daw_engine::slice_frames(buffer, start_frame, frames)
+}
+
+fn combined_gain_percent(track_volume_percent: u16, clip_gain_percent: u16) -> u16 {
+    let gain = u32::from(track_volume_percent) * u32::from(clip_gain_percent) / 100;
+    u16::try_from(gain).unwrap_or(u16::MAX)
 }
 
 fn print_help() {
@@ -906,6 +927,7 @@ fn print_help() {
     println!("  daw clip split <path> <clip-id> <split-sample>");
     println!("  daw clip duplicate <path> <clip-id> <start-sample> [track-id]");
     println!("  daw clip fade <path> <clip-id> <fade-in-samples> <fade-out-samples>");
+    println!("  daw clip gain <path> <clip-id> <gain-percent>");
     println!("  daw clip remove <path> <clip-id>");
     println!("  daw snapshot create <path> [message]");
     println!("  daw branch create <path> <name>");

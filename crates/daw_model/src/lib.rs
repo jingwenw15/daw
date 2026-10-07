@@ -96,6 +96,9 @@ pub struct Clip {
     /// Fade-out duration in samples.
     #[serde(default)]
     pub fade_out_samples: u64,
+    /// Linear clip gain percentage, where 100 is unity gain.
+    #[serde(default = "default_clip_gain_percent")]
+    pub gain_percent: u16,
 }
 
 /// A media object referenced by the project.
@@ -185,6 +188,13 @@ pub enum ProjectCommand {
         fade_in_samples: u64,
         /// Fade-out duration in samples.
         fade_out_samples: u64,
+    },
+    /// Set non-destructive clip gain.
+    SetClipGain {
+        /// Clip receiving the gain setting.
+        clip_id: StableId,
+        /// Linear gain percentage.
+        gain_percent: u16,
     },
     /// Remove an existing clip from its track.
     RemoveClip {
@@ -379,6 +389,12 @@ impl Project {
                         clip.id
                     )));
                 }
+                if clip.gain_percent > 200 {
+                    errors.push(ValidationError::new(format!(
+                        "clip {} gain_percent must be between 0 and 200",
+                        clip.id
+                    )));
+                }
                 if !self.media.iter().any(|media| media.id == clip.media_id) {
                     errors.push(ValidationError::new(format!(
                         "clip {} references unknown media {}",
@@ -519,6 +535,10 @@ impl ProjectCommand {
             } => {
                 format!("set clip {clip_id} fades in={fade_in_samples} out={fade_out_samples}")
             }
+            Self::SetClipGain {
+                clip_id,
+                gain_percent,
+            } => format!("set clip {clip_id} gain={gain_percent}"),
             Self::RemoveClip { clip_id } => format!("remove clip {clip_id}"),
             Self::SetTrackControls {
                 track_id,
@@ -870,6 +890,7 @@ pub fn add_clip(
         duration_samples,
         fade_in_samples: 0,
         fade_out_samples: 0,
+        gain_percent: default_clip_gain_percent(),
     };
     append_and_apply(
         project_dir,
@@ -1007,6 +1028,30 @@ pub fn set_clip_fades(
         .ok_or_else(|| unknown_clip_error(clip_id))
 }
 
+/// Set non-destructive gain on an existing clip.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the clip is unknown, or
+/// the gain is invalid.
+pub fn set_clip_gain(
+    project_dir: &Path,
+    clip_id: &StableId,
+    gain_percent: u16,
+) -> Result<Clip, ProjectIoError> {
+    append_and_apply(
+        project_dir,
+        ProjectCommand::SetClipGain {
+            clip_id: clip_id.clone(),
+            gain_percent,
+        },
+    )?;
+    let project = load_project(project_dir)?;
+    find_clip(&project, clip_id)
+        .cloned()
+        .ok_or_else(|| unknown_clip_error(clip_id))
+}
+
 /// Duplicate an existing clip at a new timeline start, optionally on another track.
 ///
 /// # Errors
@@ -1036,6 +1081,7 @@ pub fn duplicate_clip(
         duration_samples: source.duration_samples,
         fade_in_samples: source.fade_in_samples,
         fade_out_samples: source.fade_out_samples,
+        gain_percent: source.gain_percent,
     };
     append_and_apply(
         project_dir,
@@ -1460,6 +1506,10 @@ fn apply_command(
             fade_in_samples,
             fade_out_samples,
         } => apply_set_clip_fades(project, clip_id, *fade_in_samples, *fade_out_samples),
+        ProjectCommand::SetClipGain {
+            clip_id,
+            gain_percent,
+        } => apply_set_clip_gain(project, clip_id, *gain_percent),
         ProjectCommand::RemoveClip { clip_id } => apply_remove_clip(project, clip_id),
         ProjectCommand::SetTrackControls {
             track_id,
@@ -1555,6 +1605,7 @@ fn apply_split_clip(
         duration_samples: right_duration,
         fade_in_samples: 0,
         fade_out_samples: clip.fade_out_samples.min(right_duration),
+        gain_percent: clip.gain_percent,
     };
     project.tracks[track_index].clips.push(right);
     sort_track_clips(&mut project);
@@ -1570,6 +1621,16 @@ fn apply_set_clip_fades(
     let clip = find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?;
     clip.fade_in_samples = fade_in_samples;
     clip.fade_out_samples = fade_out_samples;
+    validate_project_state(project)
+}
+
+fn apply_set_clip_gain(
+    mut project: Project,
+    clip_id: &StableId,
+    gain_percent: u16,
+) -> Result<Project, ProjectIoError> {
+    let clip = find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?;
+    clip.gain_percent = gain_percent;
     validate_project_state(project)
 }
 
@@ -1872,6 +1933,10 @@ fn default_track_volume_percent() -> u16 {
     100
 }
 
+fn default_clip_gain_percent() -> u16 {
+    100
+}
+
 fn default_project_tempo_bpm() -> u16 {
     DEFAULT_TEMPO_BPM
 }
@@ -1882,10 +1947,10 @@ mod tests {
         add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, duplicate_clip, init_project, list_branches, load_project,
         merge_branch, project_file_path, redo_project, remove_clip, remove_track, replay_project,
-        set_clip_fades, set_clip_placement, set_clip_placement_on_track, set_clip_timing_on_track,
-        set_project_tempo, set_track_controls, set_track_name, split_clip, switch_branch,
-        undo_project, Project, ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM,
-        PROJECT_SCHEMA_VERSION,
+        set_clip_fades, set_clip_gain, set_clip_placement, set_clip_placement_on_track,
+        set_clip_timing_on_track, set_project_tempo, set_track_controls, set_track_name,
+        split_clip, switch_branch, undo_project, Project, ProjectIoError, StableId, Track,
+        DEFAULT_TEMPO_BPM, PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -2205,6 +2270,41 @@ mod tests {
         let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
 
         let result = set_clip_fades(&project_dir, &clip.id, 24_001, 0);
+
+        assert!(matches!(result, Err(ProjectIoError::Invalid(_))));
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn sets_clip_gain_through_command_log() {
+        let project_dir = temp_project_dir("clip-gain");
+        init_project(&project_dir, "Clip Gain").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+
+        let gained = set_clip_gain(&project_dir, &clip.id, 80).expect("set gain");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(gained.gain_percent, 80);
+        assert_eq!(project.tracks[0].clips, vec![gained]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn rejects_clip_gain_over_200_percent() {
+        let project_dir = temp_project_dir("clip-gain-invalid");
+        init_project(&project_dir, "Clip Gain Invalid").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+
+        let result = set_clip_gain(&project_dir, &clip.id, 201);
 
         assert!(matches!(result, Err(ProjectIoError::Invalid(_))));
         fs::remove_dir_all(project_dir).expect("cleanup project");

@@ -500,3 +500,62 @@ cargo run --bin daw -- clip fade /tmp/my-session <clip-id> <fade-in-samples> <fa
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 41
+
+Timeline fades are visible and directly editable. Clips draw fade-in and
+fade-out overlays with draggable top-edge handles, and handle edits update the
+same non-destructive fade metadata used by playback, render, history replay, and
+the CLI.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 42
+
+Clips have non-destructive gain in the project model. The command log, CLI,
+native clip editor, duplication, replay, and project render paths preserve and
+apply clip gain alongside track volume.
+
+```sh
+cargo run --bin daw -- clip gain /tmp/my-session <clip-id> <gain-percent>
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 43
+
+The arrangement view supports first-pass box selection. Shift-dragging over a
+track lane selects clips intersecting the selection rectangle, which gives the
+existing multi-select move, duplicate, delete, and edit-toolbar workflows a
+faster entry point.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 44
+
+Selected clips can be copied and pasted. Cmd+C stores selected clips with their
+relative timing and source tracks, Cmd+V pastes them at the playhead, and the
+edit toolbar exposes the same Copy and Paste actions.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 45
+
+Track headers now include a compact meter cue. During playback or playhead
+scrubbing, each track estimates visible level from the active clip waveform,
+track volume, clip gain, and mute state so mixer state is visible without
+reopening sidebar-style controls.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

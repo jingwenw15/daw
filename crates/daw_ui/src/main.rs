@@ -41,6 +41,7 @@ struct DawApp {
     edit_clip_duration_samples: String,
     edit_clip_fade_in_samples: String,
     edit_clip_fade_out_samples: String,
+    edit_clip_gain_percent: u16,
     recording_track_id: String,
     recording_start_sample: String,
     mixer_track_id: String,
@@ -57,6 +58,7 @@ struct DawApp {
     snap_beat_division: u16,
     selected_clip_ids: BTreeSet<daw_model::StableId>,
     clip_drag: Option<ActiveClipDrag>,
+    clip_clipboard: Vec<ClipboardClip>,
     track_name_edits: BTreeMap<String, String>,
     snapshot_message: String,
     status: String,
@@ -122,11 +124,22 @@ struct ActiveClipDrag {
     original_start_sample: u64,
     original_source_start_sample: u64,
     original_duration_samples: u64,
+    original_fade_in_samples: u64,
+    original_fade_out_samples: u64,
     duration_samples: u64,
     current_start_sample: u64,
     current_source_start_sample: u64,
+    current_fade_in_samples: u64,
+    current_fade_out_samples: u64,
     start_pointer_x: f32,
     group_members: Vec<ActiveClipDragMember>,
+}
+
+#[derive(Clone, Debug)]
+struct ClipboardClip {
+    source_clip_id: daw_model::StableId,
+    source_track_id: daw_model::StableId,
+    relative_start_sample: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +157,8 @@ enum ClipDragMode {
     Move,
     TrimStart,
     TrimEnd,
+    FadeIn,
+    FadeOut,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +192,8 @@ enum ArrangementAction {
         start_sample: u64,
         source_start_sample: u64,
         duration_samples: u64,
+        fade_in_samples: u64,
+        fade_out_samples: u64,
         pointer_x: f32,
     },
     UpdateClipDrag {
@@ -192,6 +209,7 @@ enum ArrangementAction {
         clip_id: daw_model::StableId,
         toggle: bool,
     },
+    SetClipSelection(BTreeSet<daw_model::StableId>),
     ArmTrack(daw_model::StableId),
     RemoveTrack(daw_model::StableId),
     RenameTrack {
@@ -227,6 +245,7 @@ impl Default for DawApp {
             edit_clip_duration_samples: "48000".to_owned(),
             edit_clip_fade_in_samples: "0".to_owned(),
             edit_clip_fade_out_samples: "0".to_owned(),
+            edit_clip_gain_percent: 100,
             recording_track_id: String::new(),
             recording_start_sample: "0".to_owned(),
             mixer_track_id: String::new(),
@@ -243,6 +262,7 @@ impl Default for DawApp {
             snap_beat_division: DEFAULT_BEAT_DIVISION,
             selected_clip_ids: BTreeSet::new(),
             clip_drag: None,
+            clip_clipboard: Vec::new(),
             track_name_edits: BTreeMap::new(),
             snapshot_message: "UI snapshot".to_owned(),
             status: "No project loaded".to_owned(),
@@ -504,6 +524,23 @@ impl DawApp {
             self.duplicate_selected_clip();
         }
         if ui
+            .add_enabled(has_clip, egui::Button::new("Copy"))
+            .on_hover_text("Cmd+C")
+            .clicked()
+        {
+            self.copy_selected_clips();
+        }
+        if ui
+            .add_enabled(
+                has_project && !self.clip_clipboard.is_empty(),
+                egui::Button::new("Paste"),
+            )
+            .on_hover_text("Cmd+V")
+            .clicked()
+        {
+            self.paste_clips_at_playhead();
+        }
+        if ui
             .add_enabled(has_clip, egui::Button::new("Delete"))
             .on_hover_text("Delete")
             .clicked()
@@ -576,6 +613,15 @@ impl DawApp {
             ui.text_edit_singleline(&mut self.edit_clip_fade_out_samples);
         });
         ui.horizontal(|ui| {
+            ui.label("Clip Gain");
+            let gain_changed = ui
+                .add(egui::Slider::new(&mut self.edit_clip_gain_percent, 0..=200).suffix("%"))
+                .changed();
+            if gain_changed && !self.edit_clip_id.is_empty() {
+                self.set_clip_gain();
+            }
+        });
+        ui.horizontal(|ui| {
             if ui.button("Use First Clip").clicked() {
                 self.use_first_clip();
             }
@@ -584,6 +630,9 @@ impl DawApp {
             }
             if ui.button("Set Fades").clicked() {
                 self.set_clip_fades();
+            }
+            if ui.button("Set Gain").clicked() {
+                self.set_clip_gain();
             }
             if ui.button("Remove Clip").clicked() {
                 self.remove_clip();
@@ -1073,6 +1122,7 @@ impl DawApp {
         self.refresh_project_after_edit(format!("Moved {} clip(s)", moved.len()));
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_arrangement_action(&mut self, action: &ArrangementAction) {
         match action {
             ArrangementAction::BeginClipDrag {
@@ -1082,6 +1132,8 @@ impl DawApp {
                 start_sample,
                 source_start_sample,
                 duration_samples,
+                fade_in_samples,
+                fade_out_samples,
                 pointer_x,
             } => self.begin_clip_drag(
                 clip_id,
@@ -1090,6 +1142,8 @@ impl DawApp {
                 *start_sample,
                 *source_start_sample,
                 *duration_samples,
+                *fade_in_samples,
+                *fade_out_samples,
                 *pointer_x,
             ),
             ArrangementAction::UpdateClipDrag {
@@ -1109,11 +1163,14 @@ impl DawApp {
                     update_active_clip_drag_timing(drag, delta_samples, *snap_grid_samples);
                     self.edit_clip_start_sample = drag.current_start_sample.to_string();
                     self.edit_clip_duration_samples = drag.duration_samples.to_string();
+                    self.edit_clip_fade_in_samples = drag.current_fade_in_samples.to_string();
+                    self.edit_clip_fade_out_samples = drag.current_fade_out_samples.to_string();
                     self.playhead_sample = drag.current_start_sample.to_string();
                 }
             }
             ArrangementAction::EndClipDrag => {
                 if let Some(drag) = self.clip_drag.take() {
+                    let dragged_clip_id = drag.clip_id.clone();
                     if drag.current_start_sample != drag.original_start_sample
                         || drag.current_track_id != drag.original_track_id
                         || drag.current_source_start_sample != drag.original_source_start_sample
@@ -1123,7 +1180,7 @@ impl DawApp {
                         })
                     {
                         let mut requests = vec![ClipMoveRequest {
-                            clip_id: drag.clip_id,
+                            clip_id: dragged_clip_id.clone(),
                             track_id: drag.current_track_id,
                             start_sample: drag.current_start_sample,
                             source_start_sample: drag.current_source_start_sample,
@@ -1140,6 +1197,15 @@ impl DawApp {
                         }));
                         self.commit_clip_moves(&requests);
                     }
+                    if drag.current_fade_in_samples != drag.original_fade_in_samples
+                        || drag.current_fade_out_samples != drag.original_fade_out_samples
+                    {
+                        self.commit_clip_fades(
+                            &dragged_clip_id,
+                            drag.current_fade_in_samples,
+                            drag.current_fade_out_samples,
+                        );
+                    }
                 }
             }
             ArrangementAction::SetPlayhead(sample) => {
@@ -1149,6 +1215,15 @@ impl DawApp {
             }
             ArrangementAction::SelectClip { clip_id, toggle } => {
                 self.select_clip_from_arrangement(clip_id, *toggle);
+            }
+            ArrangementAction::SetClipSelection(clip_ids) => {
+                self.selected_clip_ids.clone_from(clip_ids);
+                if let Some(clip_id) = self.primary_selected_clip_id().cloned() {
+                    self.select_clip_from_arrangement(&clip_id, false);
+                } else {
+                    self.clear_clip_selection();
+                }
+                self.status = format!("Selected {} clip(s)", self.selected_clip_ids.len());
             }
             ArrangementAction::ArmTrack(track_id) => {
                 self.recording_track_id = track_id.to_string();
@@ -1176,6 +1251,8 @@ impl DawApp {
         start_sample: u64,
         source_start_sample: u64,
         duration_samples: u64,
+        fade_in_samples: u64,
+        fade_out_samples: u64,
         pointer_x: f32,
     ) {
         if mode != ClipDragMode::Move || !self.selected_clip_ids.contains(clip_id) {
@@ -1203,9 +1280,13 @@ impl DawApp {
             original_start_sample: start_sample,
             original_source_start_sample: source_start_sample,
             original_duration_samples: duration_samples,
+            original_fade_in_samples: fade_in_samples,
+            original_fade_out_samples: fade_out_samples,
             duration_samples,
             current_start_sample: start_sample,
             current_source_start_sample: source_start_sample,
+            current_fade_in_samples: fade_in_samples,
+            current_fade_out_samples: fade_out_samples,
             start_pointer_x: pointer_x,
             group_members,
         });
@@ -1329,6 +1410,20 @@ impl DawApp {
             self.redo_project_edit();
             return;
         }
+        let copy_pressed = ctx.input(|input| {
+            input.modifiers.command && !input.modifiers.shift && input.key_pressed(egui::Key::C)
+        });
+        if copy_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
+            self.copy_selected_clips();
+            return;
+        }
+        let paste_pressed = ctx.input(|input| {
+            input.modifiers.command && !input.modifiers.shift && input.key_pressed(egui::Key::V)
+        });
+        if paste_pressed && !ctx.wants_keyboard_input() && !self.clip_clipboard.is_empty() {
+            self.paste_clips_at_playhead();
+            return;
+        }
         let split_pressed = ctx.input(|input| {
             !input.modifiers.command
                 && !input.modifiers.shift
@@ -1390,6 +1485,7 @@ impl DawApp {
         self.edit_clip_duration_samples = clip.duration_samples.to_string();
         self.edit_clip_fade_in_samples = clip.fade_in_samples.to_string();
         self.edit_clip_fade_out_samples = clip.fade_out_samples.to_string();
+        self.edit_clip_gain_percent = clip.gain_percent;
     }
 
     fn move_clip(&mut self) {
@@ -1456,6 +1552,43 @@ impl DawApp {
                 ));
             }
             Err(error) => self.status = format!("Set clip fades failed: {error}"),
+        }
+    }
+
+    fn commit_clip_fades(
+        &mut self,
+        clip_id: &daw_model::StableId,
+        fade_in_samples: u64,
+        fade_out_samples: u64,
+    ) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::set_clip_fades(&path, clip_id, fade_in_samples, fade_out_samples) {
+            Ok(clip) => {
+                self.set_clip_edit_fields(&clip);
+                self.refresh_project_after_edit(format!(
+                    "Set clip {} fades in={} out={}",
+                    clip.id, clip.fade_in_samples, clip.fade_out_samples
+                ));
+            }
+            Err(error) => self.status = format!("Set clip fades failed: {error}"),
+        }
+    }
+
+    fn set_clip_gain(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::set_clip_gain(
+            &path,
+            &daw_model::StableId::from_string(self.edit_clip_id.clone()),
+            self.edit_clip_gain_percent,
+        ) {
+            Ok(clip) => {
+                self.set_clip_edit_fields(&clip);
+                self.refresh_project_after_edit(format!(
+                    "Set clip {} gain={}",
+                    clip.id, clip.gain_percent
+                ));
+            }
+            Err(error) => self.status = format!("Set clip gain failed: {error}"),
         }
     }
 
@@ -1584,6 +1717,72 @@ impl DawApp {
             self.set_clip_edit_fields(clip);
         }
         self.refresh_project_after_edit(format!("Duplicated {} clip(s)", duplicated.len()));
+    }
+
+    fn copy_selected_clips(&mut self) {
+        let Some(project) = &self.project else {
+            "Open a project before copying clips".clone_into(&mut self.status);
+            return;
+        };
+        let selected = selected_clip_locations(project, &self.selected_clip_ids);
+        let Some(earliest_start) = selected.iter().map(|clip| clip.original_start_sample).min()
+        else {
+            "No clip selected".clone_into(&mut self.status);
+            return;
+        };
+        self.clip_clipboard = selected
+            .into_iter()
+            .map(|clip| ClipboardClip {
+                source_clip_id: clip.clip_id,
+                source_track_id: clip.track_id,
+                relative_start_sample: clip.original_start_sample - earliest_start,
+            })
+            .collect();
+        self.status = format!("Copied {} clip(s)", self.clip_clipboard.len());
+    }
+
+    fn paste_clips_at_playhead(&mut self) {
+        if self.clip_clipboard.is_empty() {
+            "Clipboard is empty".clone_into(&mut self.status);
+            return;
+        }
+        let start_sample = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let path = PathBuf::from(&self.project_path);
+        let Some(project) = &self.project else {
+            "Open a project before pasting clips".clone_into(&mut self.status);
+            return;
+        };
+        let existing_tracks = project
+            .tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut pasted = Vec::new();
+        for item in &self.clip_clipboard {
+            let target_track = existing_tracks
+                .contains(&item.source_track_id)
+                .then_some(&item.source_track_id);
+            let paste_start = start_sample.saturating_add(item.relative_start_sample);
+            match daw_model::duplicate_clip(&path, &item.source_clip_id, target_track, paste_start)
+            {
+                Ok(clip) => pasted.push(clip),
+                Err(error) => {
+                    self.status = format!("Paste clip failed: {error}");
+                    return;
+                }
+            }
+        }
+        self.selected_clip_ids = pasted.iter().map(|clip| clip.id.clone()).collect();
+        if let Some(clip) = pasted.first() {
+            self.set_clip_edit_fields(clip);
+        }
+        self.refresh_project_after_edit(format!("Pasted {} clip(s)", pasted.len()));
     }
 
     fn remove_track(&mut self, track_id: &daw_model::StableId) {
@@ -1874,7 +2073,7 @@ fn render_time_ruler(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_track_lane(
     ui: &mut egui::Ui,
     project: &daw_model::Project,
@@ -1910,9 +2109,16 @@ fn render_track_lane(
         [rect.left_bottom(), rect.right_bottom()],
         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(52, 56, 64)),
     );
-    if let Some(action) =
-        render_track_header_controls(ui, header_rect, track, recording_track_id, track_name_edits)
-    {
+    if let Some(action) = render_track_header_controls(
+        ui,
+        header_rect,
+        project,
+        track,
+        waveforms,
+        playhead,
+        recording_track_id,
+        track_name_edits,
+    ) {
         actions.push(action);
     }
 
@@ -1957,6 +2163,11 @@ fn render_track_lane(
     }
 
     if active_clip_drag.is_none() {
+        if let Some(selected) =
+            box_select_in_lane(ui, lane_rect, track, timeline_samples, selected_clip_ids)
+        {
+            actions.push(ArrangementAction::SetClipSelection(selected));
+        }
         if let Some(sample) = lane_pointer_sample(
             ui,
             lane_rect,
@@ -1999,11 +2210,50 @@ fn render_track_lane(
     actions
 }
 
-#[allow(clippy::too_many_lines)]
+fn box_select_in_lane(
+    ui: &egui::Ui,
+    lane_rect: egui::Rect,
+    track: &daw_model::Track,
+    timeline_samples: u64,
+    selected_clip_ids: &BTreeSet<daw_model::StableId>,
+) -> Option<BTreeSet<daw_model::StableId>> {
+    let id = egui::Id::new(("lane-box-select", track.id.to_string()));
+    let response = ui.interact(lane_rect, id, egui::Sense::click_and_drag());
+    if !ui.input(|input| input.modifiers.shift) || !response.dragged() {
+        return None;
+    }
+    let current = response.interact_pointer_pos()?;
+    let start = current - response.drag_delta();
+    let selection_rect = egui::Rect::from_two_pos(start, current);
+    ui.painter_at(lane_rect).rect_stroke(
+        selection_rect,
+        0.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(248, 231, 126)),
+        egui::StrokeKind::Inside,
+    );
+    let mut selected = selected_clip_ids.clone();
+    for clip in &track.clips {
+        let rect = clip_rect(
+            lane_rect,
+            clip.start_sample,
+            clip.duration_samples,
+            timeline_samples,
+        );
+        if rect.intersects(selection_rect) {
+            selected.insert(clip.id.clone());
+        }
+    }
+    Some(selected)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_track_header_controls(
     ui: &mut egui::Ui,
     header_rect: egui::Rect,
+    project: &daw_model::Project,
     track: &daw_model::Track,
+    waveforms: &[daw_media::WaveformSummary],
+    playhead: u64,
     recording_track_id: &str,
     track_name_edits: &mut BTreeMap<String, String>,
 ) -> Option<ArrangementAction> {
@@ -2078,6 +2328,11 @@ fn render_track_header_controls(
         ),
         egui::Button::new("Del").fill(egui::Color32::from_rgb(68, 48, 52)),
     );
+    draw_track_meter(
+        &painter,
+        header_rect,
+        track_meter_level(project, track, waveforms, playhead),
+    );
 
     let muted = if muted_response.clicked() {
         !track.muted
@@ -2114,6 +2369,48 @@ fn render_track_header_controls(
     } else {
         None
     }
+}
+
+fn draw_track_meter(painter: &egui::Painter, header_rect: egui::Rect, level: f32) {
+    let meter_rect = egui::Rect::from_min_size(
+        header_rect.left_top() + egui::vec2(160.0, 61.0),
+        egui::vec2(32.0, 14.0),
+    );
+    painter.rect_filled(meter_rect, 2.0, egui::Color32::from_rgb(24, 27, 31));
+    let filled = egui::Rect::from_min_max(
+        meter_rect.left_top(),
+        egui::pos2(
+            meter_rect.left() + meter_rect.width() * level.clamp(0.0, 1.0),
+            meter_rect.bottom(),
+        ),
+    );
+    painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(78, 184, 122));
+}
+
+fn track_meter_level(
+    project: &daw_model::Project,
+    track: &daw_model::Track,
+    waveforms: &[daw_media::WaveformSummary],
+    playhead: u64,
+) -> f32 {
+    if track.muted {
+        return 0.0;
+    }
+    let active = track.clips.iter().filter(|clip| {
+        playhead >= clip.start_sample
+            && playhead < clip.start_sample.saturating_add(clip.duration_samples)
+    });
+    active
+        .filter_map(|clip| clip_waveform(project, waveforms, clip).map(|waveform| (clip, waveform)))
+        .flat_map(|(clip, waveform)| {
+            let gain = f32::from(track.volume_percent) * f32::from(clip.gain_percent) / 10_000.0;
+            waveform
+                .peaks
+                .iter()
+                .map(move |peak| peak.min.abs().max(peak.max.abs()) * gain)
+        })
+        .fold(0.0_f32, f32::max)
+        .clamp(0.0, 1.0)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -2303,6 +2600,30 @@ fn update_active_clip_drag_timing(
             drag.current_source_start_sample = drag.original_source_start_sample;
             drag.duration_samples = new_end.saturating_sub(drag.original_start_sample).max(1);
         }
+        ClipDragMode::FadeIn => {
+            let new_fade = snap_sample(
+                apply_sample_delta(drag.original_fade_in_samples, delta_samples),
+                snap_grid_samples,
+            )
+            .min(drag.original_duration_samples);
+            drag.current_fade_in_samples = new_fade;
+            drag.current_fade_out_samples = drag.original_fade_out_samples;
+            drag.current_start_sample = drag.original_start_sample;
+            drag.current_source_start_sample = drag.original_source_start_sample;
+            drag.duration_samples = drag.original_duration_samples;
+        }
+        ClipDragMode::FadeOut => {
+            let new_fade = snap_sample(
+                apply_sample_delta(drag.original_fade_out_samples, -delta_samples),
+                snap_grid_samples,
+            )
+            .min(drag.original_duration_samples);
+            drag.current_fade_in_samples = drag.original_fade_in_samples;
+            drag.current_fade_out_samples = new_fade;
+            drag.current_start_sample = drag.original_start_sample;
+            drag.current_source_start_sample = drag.original_source_start_sample;
+            drag.duration_samples = drag.original_duration_samples;
+        }
     }
 }
 
@@ -2367,6 +2688,9 @@ fn draw_clip_body(
         );
     }
 
+    draw_clip_fade_overlays(painter, rect, clip);
+    draw_clip_gain_badge(painter, rect, clip.gain_percent);
+
     if highlighted || selected {
         painter.rect_stroke(
             rect,
@@ -2382,6 +2706,63 @@ fn draw_clip_body(
             egui::StrokeKind::Inside,
         );
     }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn draw_clip_fade_overlays(painter: &egui::Painter, rect: egui::Rect, clip: &daw_model::Clip) {
+    if clip.duration_samples == 0 {
+        return;
+    }
+    let fade_color = egui::Color32::from_rgba_unmultiplied(12, 16, 18, 118);
+    if clip.fade_in_samples > 0 {
+        let width = rect.width() * clip.fade_in_samples as f32 / clip.duration_samples as f32;
+        let x = (rect.left() + width).min(rect.right());
+        let points = vec![
+            rect.left_top(),
+            rect.left_bottom(),
+            egui::pos2(x, rect.bottom()),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            fade_color,
+            egui::Stroke::NONE,
+        ));
+        painter.line_segment(
+            [rect.left_bottom(), egui::pos2(x, rect.top())],
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(245, 221, 121)),
+        );
+    }
+    if clip.fade_out_samples > 0 {
+        let width = rect.width() * clip.fade_out_samples as f32 / clip.duration_samples as f32;
+        let x = (rect.right() - width).max(rect.left());
+        let points = vec![
+            egui::pos2(x, rect.bottom()),
+            rect.right_bottom(),
+            rect.right_top(),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            fade_color,
+            egui::Stroke::NONE,
+        ));
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), rect.right_bottom()],
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(245, 221, 121)),
+        );
+    }
+}
+
+fn draw_clip_gain_badge(painter: &egui::Painter, rect: egui::Rect, gain_percent: u16) {
+    if gain_percent == 100 {
+        return;
+    }
+    painter.text(
+        rect.right_top() + egui::vec2(-8.0, 7.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{gain_percent}%"),
+        egui::FontId::monospace(11.0),
+        egui::Color32::from_rgb(255, 242, 168),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2546,6 +2927,7 @@ fn render_clip(
 
     if selected || response.hovered() {
         draw_clip_trim_handles(&painter, draw_rect, selected);
+        draw_clip_fade_handles(&painter, draw_rect, clip, selected);
     }
 
     if let Some(drag) = this_clip_drag {
@@ -2578,11 +2960,11 @@ fn render_clip(
 
     let handle_width = draw_rect.width().clamp(6.0, 10.0);
     let left_handle_rect = egui::Rect::from_min_max(
-        draw_rect.left_top(),
+        egui::pos2(draw_rect.left(), draw_rect.top() + 18.0),
         egui::pos2(draw_rect.left() + handle_width, draw_rect.bottom()),
     );
     let right_handle_rect = egui::Rect::from_min_max(
-        egui::pos2(draw_rect.right() - handle_width, draw_rect.top()),
+        egui::pos2(draw_rect.right() - handle_width, draw_rect.top() + 18.0),
         draw_rect.right_bottom(),
     );
     let left_handle_response = ui.interact(
@@ -2607,6 +2989,8 @@ fn render_clip(
                     start_sample: clip.start_sample,
                     source_start_sample: clip.source_start_sample,
                     duration_samples: clip.duration_samples,
+                    fade_in_samples: clip.fade_in_samples,
+                    fade_out_samples: clip.fade_out_samples,
                     pointer_x: position.x,
                 }),
             };
@@ -2624,6 +3008,57 @@ fn render_clip(
                     start_sample: clip.start_sample,
                     source_start_sample: clip.source_start_sample,
                     duration_samples: clip.duration_samples,
+                    fade_in_samples: clip.fade_in_samples,
+                    fade_out_samples: clip.fade_out_samples,
+                    pointer_x: position.x,
+                }),
+            };
+        }
+    }
+
+    let fade_in_handle = fade_in_handle_rect(draw_rect, clip);
+    let fade_out_handle = fade_out_handle_rect(draw_rect, clip);
+    let fade_in_response = ui.interact(
+        fade_in_handle,
+        egui::Id::new(("clip-fade-in", clip.id.to_string())),
+        egui::Sense::click_and_drag(),
+    );
+    let fade_out_response = ui.interact(
+        fade_out_handle,
+        egui::Id::new(("clip-fade-out", clip.id.to_string())),
+        egui::Sense::click_and_drag(),
+    );
+    if active_clip_drag.is_none() && fade_in_response.drag_started() {
+        if let Some(position) = fade_in_response.interact_pointer_pos() {
+            return ClipRenderResult {
+                rect: base_clip_rect,
+                action: Some(ArrangementAction::BeginClipDrag {
+                    clip_id: clip.id.clone(),
+                    track_id: track_id.clone(),
+                    mode: ClipDragMode::FadeIn,
+                    start_sample: clip.start_sample,
+                    source_start_sample: clip.source_start_sample,
+                    duration_samples: clip.duration_samples,
+                    fade_in_samples: clip.fade_in_samples,
+                    fade_out_samples: clip.fade_out_samples,
+                    pointer_x: position.x,
+                }),
+            };
+        }
+    }
+    if active_clip_drag.is_none() && fade_out_response.drag_started() {
+        if let Some(position) = fade_out_response.interact_pointer_pos() {
+            return ClipRenderResult {
+                rect: base_clip_rect,
+                action: Some(ArrangementAction::BeginClipDrag {
+                    clip_id: clip.id.clone(),
+                    track_id: track_id.clone(),
+                    mode: ClipDragMode::FadeOut,
+                    start_sample: clip.start_sample,
+                    source_start_sample: clip.source_start_sample,
+                    duration_samples: clip.duration_samples,
+                    fade_in_samples: clip.fade_in_samples,
+                    fade_out_samples: clip.fade_out_samples,
                     pointer_x: position.x,
                 }),
             };
@@ -2641,6 +3076,8 @@ fn render_clip(
                     start_sample: clip.start_sample,
                     source_start_sample: clip.source_start_sample,
                     duration_samples: clip.duration_samples,
+                    fade_in_samples: clip.fade_in_samples,
+                    fade_out_samples: clip.fade_out_samples,
                     pointer_x: position.x,
                 }),
             };
@@ -2681,6 +3118,45 @@ fn draw_clip_trim_handles(painter: &egui::Painter, rect: egui::Rect, selected: b
     );
     painter.rect_filled(left.shrink2(egui::vec2(2.0, 6.0)), 2.0, color);
     painter.rect_filled(right.shrink2(egui::vec2(2.0, 6.0)), 2.0, color);
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn fade_in_handle_rect(rect: egui::Rect, clip: &daw_model::Clip) -> egui::Rect {
+    let x = if clip.duration_samples == 0 {
+        rect.left()
+    } else {
+        rect.left()
+            + (rect.width() * clip.fade_in_samples as f32 / clip.duration_samples as f32)
+                .clamp(0.0, rect.width())
+    };
+    egui::Rect::from_center_size(egui::pos2(x, rect.top() + 9.0), egui::vec2(14.0, 14.0))
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn fade_out_handle_rect(rect: egui::Rect, clip: &daw_model::Clip) -> egui::Rect {
+    let x = if clip.duration_samples == 0 {
+        rect.right()
+    } else {
+        rect.right()
+            - (rect.width() * clip.fade_out_samples as f32 / clip.duration_samples as f32)
+                .clamp(0.0, rect.width())
+    };
+    egui::Rect::from_center_size(egui::pos2(x, rect.top() + 9.0), egui::vec2(14.0, 14.0))
+}
+
+fn draw_clip_fade_handles(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    clip: &daw_model::Clip,
+    selected: bool,
+) {
+    let color = if selected {
+        egui::Color32::from_rgb(255, 238, 131)
+    } else {
+        egui::Color32::from_rgb(214, 244, 245)
+    };
+    painter.circle_filled(fade_in_handle_rect(rect, clip).center(), 4.0, color);
+    painter.circle_filled(fade_out_handle_rect(rect, clip).center(), 4.0, color);
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -3101,10 +3577,15 @@ fn mix_clip_from_project(
         output,
         &limited,
         destination_start,
-        track.volume_percent,
+        combined_gain_percent(track.volume_percent, clip.gain_percent),
         track.muted,
     );
     Ok(())
+}
+
+fn combined_gain_percent(track_volume_percent: u16, clip_gain_percent: u16) -> u16 {
+    let gain = u32::from(track_volume_percent) * u32::from(clip_gain_percent) / 100;
+    u16::try_from(gain).unwrap_or(u16::MAX)
 }
 
 fn slice_buffer_frames(
