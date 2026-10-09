@@ -42,12 +42,16 @@ struct DawApp {
     edit_clip_fade_in_samples: String,
     edit_clip_fade_out_samples: String,
     edit_clip_gain_percent: u16,
+    edit_clip_name: String,
     recording_track_id: String,
     recording_start_sample: String,
     mixer_track_id: String,
     mixer_volume_percent: String,
+    mixer_pan_percent: i16,
     mixer_muted: bool,
     mixer_solo: bool,
+    marker_name: String,
+    export_path: String,
     timeline_zoom: f32,
     metronome_enabled: bool,
     count_in_enabled: bool,
@@ -219,6 +223,7 @@ enum ArrangementAction {
     SetTrackControls {
         track_id: daw_model::StableId,
         volume_percent: u16,
+        pan_percent: i16,
         muted: bool,
         solo: bool,
     },
@@ -246,12 +251,16 @@ impl Default for DawApp {
             edit_clip_fade_in_samples: "0".to_owned(),
             edit_clip_fade_out_samples: "0".to_owned(),
             edit_clip_gain_percent: 100,
+            edit_clip_name: String::new(),
             recording_track_id: String::new(),
             recording_start_sample: "0".to_owned(),
             mixer_track_id: String::new(),
             mixer_volume_percent: "100".to_owned(),
+            mixer_pan_percent: 0,
             mixer_muted: false,
             mixer_solo: false,
+            marker_name: "Marker".to_owned(),
+            export_path: "/private/tmp/daw-ui-project/exports/mix.wav".to_owned(),
             timeline_zoom: 1.0,
             metronome_enabled: false,
             count_in_enabled: false,
@@ -396,6 +405,20 @@ impl DawApp {
                         self.set_loop_from_playhead();
                     }
                 });
+                ui.add_sized(
+                    [92.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.marker_name),
+                );
+                if ui.button("Add Marker").clicked() {
+                    self.add_marker_at_playhead();
+                }
+                ui.add_sized(
+                    [210.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.export_path),
+                );
+                if ui.button("Export").clicked() {
+                    self.export_project_mix();
+                }
                 if ui
                     .add_enabled(self.playback.is_none(), egui::Button::new("Play"))
                     .clicked()
@@ -601,6 +624,19 @@ impl DawApp {
         ui.label("Edit clip id");
         ui.text_edit_singleline(&mut self.edit_clip_id);
         ui.horizontal(|ui| {
+            ui.label("Name");
+            let response = ui.add_sized(
+                [180.0, 24.0],
+                egui::TextEdit::singleline(&mut self.edit_clip_name),
+            );
+            if response.lost_focus()
+                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                && !self.edit_clip_id.is_empty()
+            {
+                self.set_clip_name();
+            }
+        });
+        ui.horizontal(|ui| {
             ui.label("Start");
             ui.text_edit_singleline(&mut self.edit_clip_start_sample);
             ui.label("Duration");
@@ -633,6 +669,9 @@ impl DawApp {
             }
             if ui.button("Set Gain").clicked() {
                 self.set_clip_gain();
+            }
+            if ui.button("Set Name").clicked() {
+                self.set_clip_name();
             }
             if ui.button("Remove Clip").clicked() {
                 self.remove_clip();
@@ -880,6 +919,7 @@ impl DawApp {
     fn set_mixer_fields_from_track(&mut self, track: &daw_model::Track) {
         self.mixer_track_id = track.id.to_string();
         self.mixer_volume_percent = track.volume_percent.to_string();
+        self.mixer_pan_percent = track.pan_percent;
         self.mixer_muted = track.muted;
         self.mixer_solo = track.solo;
     }
@@ -1236,9 +1276,10 @@ impl DawApp {
             ArrangementAction::SetTrackControls {
                 track_id,
                 volume_percent,
+                pan_percent,
                 muted,
                 solo,
-            } => self.commit_track_controls(track_id, *volume_percent, *muted, *solo),
+            } => self.commit_track_controls(track_id, *volume_percent, *pan_percent, *muted, *solo),
         }
     }
 
@@ -1314,15 +1355,23 @@ impl DawApp {
         &mut self,
         track_id: &daw_model::StableId,
         volume_percent: u16,
+        pan_percent: i16,
         muted: bool,
         solo: bool,
     ) {
         let path = PathBuf::from(&self.project_path);
-        match daw_model::set_track_controls(&path, track_id, volume_percent, muted, solo) {
+        match daw_model::set_track_controls(
+            &path,
+            track_id,
+            volume_percent,
+            pan_percent,
+            muted,
+            solo,
+        ) {
             Ok(track) => {
                 let message = format!(
-                    "Set '{}' controls: volume={} muted={} solo={}",
-                    track.name, track.volume_percent, track.muted, track.solo
+                    "Set '{}' controls: volume={} pan={} muted={} solo={}",
+                    track.name, track.volume_percent, track.pan_percent, track.muted, track.solo
                 );
                 self.set_mixer_fields_from_track(&track);
                 self.refresh_project_after_edit(message);
@@ -1486,6 +1535,7 @@ impl DawApp {
         self.edit_clip_fade_in_samples = clip.fade_in_samples.to_string();
         self.edit_clip_fade_out_samples = clip.fade_out_samples.to_string();
         self.edit_clip_gain_percent = clip.gain_percent;
+        self.edit_clip_name = clip.name.clone().unwrap_or_default();
     }
 
     fn move_clip(&mut self) {
@@ -1589,6 +1639,23 @@ impl DawApp {
                 ));
             }
             Err(error) => self.status = format!("Set clip gain failed: {error}"),
+        }
+    }
+
+    fn set_clip_name(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        let name = self.edit_clip_name.trim();
+        let name = (!name.is_empty()).then_some(name);
+        match daw_model::set_clip_name(
+            &path,
+            &daw_model::StableId::from_string(self.edit_clip_id.clone()),
+            name,
+        ) {
+            Ok(clip) => {
+                self.set_clip_edit_fields(&clip);
+                self.refresh_project_after_edit(format!("Set clip {} name", clip.id));
+            }
+            Err(error) => self.status = format!("Set clip name failed: {error}"),
         }
     }
 
@@ -1817,6 +1884,48 @@ impl DawApp {
         );
     }
 
+    fn add_marker_at_playhead(&mut self) {
+        let sample = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let name = self.marker_name.trim();
+        if name.is_empty() {
+            "Marker name cannot be empty".clone_into(&mut self.status);
+            return;
+        }
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::add_marker(&path, sample, name) {
+            Ok(marker) => self.refresh_project_after_edit(format!(
+                "Added marker '{}' at {}",
+                marker.name, marker.sample
+            )),
+            Err(error) => self.status = format!("Add marker failed: {error}"),
+        }
+    }
+
+    fn export_project_mix(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        let start_sample = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        match render_project_buffer(&path, 1.0, start_sample, None, self.metronome_enabled)
+            .and_then(|buffer| {
+                daw_engine::write_wav(Path::new(&self.export_path), &buffer)
+                    .map_err(|error| format!("Export failed: {error}"))
+            }) {
+            Ok(()) => self.status = format!("Exported mix to {}", self.export_path),
+            Err(error) => self.status = error,
+        }
+    }
+
     fn loop_region(&self) -> Result<Option<LoopRegion>, String> {
         if !self.loop_enabled {
             return Ok(None);
@@ -1971,6 +2080,7 @@ fn render_arrangement(
                 timeline_samples,
                 playhead,
                 timeline_grid,
+                &project.markers,
             ) {
                 actions.push(ArrangementAction::SetPlayhead(sample));
             }
@@ -2022,6 +2132,7 @@ fn render_time_ruler(
     timeline_samples: u64,
     playhead: u64,
     timeline_grid: TimelineGrid,
+    markers: &[daw_model::Marker],
 ) -> Option<u64> {
     let desired = egui::vec2(TRACK_HEADER_WIDTH + timeline_width, 34.0);
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
@@ -2059,6 +2170,7 @@ fn render_time_ruler(
             egui::Color32::from_rgb(188, 192, 200),
         );
     }
+    draw_markers(&painter, timeline_rect, timeline_samples, markers);
     draw_playhead(&painter, timeline_rect, playhead, timeline_samples);
     response
         .interact_pointer_pos()
@@ -2071,6 +2183,30 @@ fn render_time_ruler(
                 timeline_grid.snap,
             )
         })
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn draw_markers(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    timeline_samples: u64,
+    markers: &[daw_model::Marker],
+) {
+    for marker in markers {
+        let fraction = marker.sample as f32 / timeline_samples.max(1) as f32;
+        let x = egui::lerp(rect.left()..=rect.right(), fraction.clamp(0.0, 1.0));
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(96, 151, 220)),
+        );
+        painter.text(
+            egui::pos2(x + 4.0, rect.top() + 18.0),
+            egui::Align2::LEFT_TOP,
+            &marker.name,
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_rgb(174, 209, 248),
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2272,19 +2408,27 @@ fn render_track_header_controls(
     painter.text(
         header_rect.left_top() + egui::vec2(12.0, 34.0),
         egui::Align2::LEFT_TOP,
-        format!("{}%", track.volume_percent),
+        format!("{}%  P{}", track.volume_percent, track.pan_percent),
         egui::FontId::monospace(12.0),
         egui::Color32::from_rgb(166, 172, 184),
     );
 
     let mut volume = track.volume_percent;
     let slider_rect = egui::Rect::from_min_size(
-        header_rect.left_top() + egui::vec2(70.0, 30.0),
-        egui::vec2(118.0, 20.0),
+        header_rect.left_top() + egui::vec2(92.0, 30.0),
+        egui::vec2(72.0, 20.0),
     );
     let volume_response = ui.put(
         slider_rect,
         egui::Slider::new(&mut volume, 0..=200).show_value(false),
+    );
+    let mut pan = track.pan_percent;
+    let pan_response = ui.put(
+        egui::Rect::from_min_size(
+            header_rect.left_top() + egui::vec2(172.0, 30.0),
+            egui::vec2(60.0, 20.0),
+        ),
+        egui::Slider::new(&mut pan, -100..=100).show_value(false),
     );
 
     let muted_response = ui.put(
@@ -2358,11 +2502,12 @@ fn render_track_header_controls(
     if remove_response.clicked() {
         return Some(ArrangementAction::RemoveTrack(track.id.clone()));
     }
-    let volume_changed = volume_response.changed();
-    if volume_changed || muted != track.muted || solo != track.solo {
+    let controls_changed = volume_response.changed() || pan_response.changed();
+    if controls_changed || muted != track.muted || solo != track.solo {
         Some(ArrangementAction::SetTrackControls {
             track_id: track.id.clone(),
             volume_percent: volume,
+            pan_percent: pan,
             muted,
             solo,
         })
@@ -2685,6 +2830,16 @@ fn draw_clip_body(
             label,
             egui::FontId::proportional(12.0),
             egui::Color32::from_rgb(218, 238, 240),
+        );
+    }
+
+    if let Some(name) = clip.name.as_deref() {
+        painter.text(
+            rect.left_top() + egui::vec2(8.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            name,
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(235, 250, 250),
         );
     }
 
@@ -3260,7 +3415,16 @@ fn timeline_sample_span(
             .start_sample
             .saturating_add(preview.duration_samples)
     });
-    project_span.max(live_span).max(MIN_TIMELINE_SAMPLES)
+    let marker_span = project
+        .markers
+        .iter()
+        .map(|marker| marker.sample)
+        .max()
+        .unwrap_or(MIN_TIMELINE_SAMPLES);
+    project_span
+        .max(live_span)
+        .max(marker_span)
+        .max(MIN_TIMELINE_SAMPLES)
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -3573,11 +3737,12 @@ fn mix_clip_from_project(
         clip.fade_in_samples,
         clip.fade_out_samples,
     );
-    daw_engine::mix_clip(
+    daw_engine::mix_clip_panned(
         output,
         &limited,
         destination_start,
         combined_gain_percent(track.volume_percent, clip.gain_percent),
+        track.pan_percent,
         track.muted,
     );
     Ok(())

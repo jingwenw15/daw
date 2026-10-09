@@ -559,3 +559,62 @@ reopening sidebar-style controls.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 46
+
+Tracks have stereo pan in the project model, command log, CLI, native track
+headers, and render path. Old projects default to centered pan, and track
+controls can now set volume, pan, mute, and solo together.
+
+```sh
+cargo run --bin daw -- track controls /tmp/my-session <track-id> <volume-percent> <pan-percent> <muted> <solo>
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 47
+
+Clips can be labeled without renaming their source media. The project model,
+command log, CLI, advanced clip editor, duplication, splitting, and clip drawing
+all preserve and show optional clip names.
+
+```sh
+cargo run --bin daw -- clip name /tmp/my-session <clip-id> <name-or-clear>
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 48
+
+Projects have timeline markers. Markers are stored as first-class project data,
+validated with stable IDs, replayed through history, and exposed through CLI add,
+remove, and list commands.
+
+```sh
+cargo run --bin daw -- marker add /tmp/my-session <sample> <name>
+cargo run --bin daw -- marker list /tmp/my-session
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 49
+
+The native ruler draws project markers and the transport can add a marker at the
+current playhead. Timeline span calculations include markers so distant markers
+remain reachable even before audio reaches that section.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 50
+
+The native transport can export the current project mix to WAV from the UI.
+Export uses the same render path as playback, including fades, clip gain, track
+volume, pan, mute, solo, and optional metronome mixing.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

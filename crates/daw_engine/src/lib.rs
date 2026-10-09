@@ -525,6 +525,18 @@ pub fn mix_clip(
     volume_percent: u16,
     muted: bool,
 ) {
+    mix_clip_panned(destination, clip, start_frame, volume_percent, 0, muted);
+}
+
+/// Mix a clip buffer into a destination at a start frame with simple stereo pan.
+pub fn mix_clip_panned(
+    destination: &mut AudioBuffer,
+    clip: &AudioBuffer,
+    start_frame: usize,
+    volume_percent: u16,
+    pan_percent: i16,
+    muted: bool,
+) {
     if muted || destination.channels != clip.channels || destination.sample_rate != clip.sample_rate
     {
         return;
@@ -532,6 +544,7 @@ pub fn mix_clip(
 
     let destination_channels = usize::from(destination.channels);
     let gain = f32::from(volume_percent) / 100.0;
+    let (left_gain, right_gain) = pan_gains(pan_percent);
     for clip_frame in 0..clip.frames() {
         let destination_frame = start_frame + clip_frame;
         if destination_frame >= destination.frames() {
@@ -540,10 +553,24 @@ pub fn mix_clip(
         for channel in 0..destination_channels {
             let destination_index = destination_frame * destination_channels + channel;
             let clip_index = clip_frame * destination_channels + channel;
+            let pan_gain = match (destination_channels, channel) {
+                (2, 0) => left_gain,
+                (2, 1) => right_gain,
+                _ => 1.0,
+            };
             destination.samples[destination_index] = (destination.samples[destination_index]
-                + clip.samples[clip_index] * gain)
+                + clip.samples[clip_index] * gain * pan_gain)
                 .clamp(-1.0, 1.0);
         }
+    }
+}
+
+fn pan_gains(pan_percent: i16) -> (f32, f32) {
+    let pan = f32::from(pan_percent.clamp(-100, 100)) / 100.0;
+    if pan < 0.0 {
+        (1.0, 1.0 + pan)
+    } else {
+        (1.0 - pan, 1.0)
     }
 }
 
@@ -1192,8 +1219,9 @@ fn parse_pcm16_wav(bytes: &[u8]) -> Result<AudioBuffer, RenderError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_clip_fades, convert_channels, mix_clip, read_wav, render_metronome, render_silence,
-        render_sine, slice_frames, write_wav, AudioBuffer, DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE,
+        apply_clip_fades, convert_channels, mix_clip, mix_clip_panned, read_wav, render_metronome,
+        render_silence, render_sine, slice_frames, write_wav, AudioBuffer, DEFAULT_CHANNELS,
+        DEFAULT_SAMPLE_RATE,
     };
     use std::{fs, path::PathBuf};
 
@@ -1270,6 +1298,25 @@ mod tests {
         assert_eq!(decoded.frames(), clip.frames());
         assert!(destination.samples.iter().any(|sample| sample.abs() > 0.0));
         fs::remove_file(output).expect("cleanup");
+    }
+
+    #[test]
+    fn mixes_clip_with_stereo_pan() {
+        let decoded = AudioBuffer {
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            channels: 2,
+            samples: vec![0.5, 0.5],
+        };
+        let mut destination = AudioBuffer {
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            channels: 2,
+            samples: vec![0.0, 0.0],
+        };
+
+        mix_clip_panned(&mut destination, &decoded, 0, 100, -100, false);
+
+        assert!((destination.samples[0] - 0.5).abs() < f32::EPSILON);
+        assert!(destination.samples[1].abs() < f32::EPSILON);
     }
 
     #[test]

@@ -58,6 +58,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Some("project") => run_project(args),
         Some("track") => run_track(args),
         Some("clip") => run_clip(args),
+        Some("marker") => run_marker(args),
         Some("snapshot") => run_snapshot(args),
         Some("branch") => run_branch(args),
         Some("vcs") => run_vcs(args),
@@ -461,6 +462,7 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         }
         Some("fade") => run_clip_fade(args),
         Some("gain") => run_clip_gain(args),
+        Some("name") => run_clip_name(args),
         Some("remove") => {
             let project = required_arg(&mut args, "path")?;
             let clip_id = required_arg(&mut args, "clip-id")?;
@@ -513,6 +515,71 @@ fn run_clip_gain(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     .map_err(|error| format!("failed to set clip gain: {error}"))?;
     println!("set clip {} gain={}", clip.id, clip.gain_percent);
     Ok(())
+}
+
+fn run_clip_name(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let project = required_arg(&mut args, "path")?;
+    let clip_id = required_arg(&mut args, "clip-id")?;
+    let name = required_arg(&mut args, "name-or-clear")?;
+    no_extra_args(args)?;
+    let name = (name != "clear").then_some(name.as_str());
+    let clip = daw_model::set_clip_name(
+        project.as_ref(),
+        &daw_model::StableId::from_string(clip_id),
+        name,
+    )
+    .map_err(|error| format!("failed to set clip name: {error}"))?;
+    println!(
+        "set clip {} name={}",
+        clip.id,
+        clip.name.as_deref().unwrap_or("none")
+    );
+    Ok(())
+}
+
+fn run_marker(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    match args.next().as_deref() {
+        Some("add") => {
+            let path = required_arg(&mut args, "path")?;
+            let sample = required_u64(&mut args, "sample")?;
+            let name = required_arg(&mut args, "name")?;
+            no_extra_args(args)?;
+            let marker = daw_model::add_marker(path.as_ref(), sample, &name)
+                .map_err(|error| format!("failed to add marker: {error}"))?;
+            println!("added marker '{}' at {}", marker.name, marker.sample);
+            Ok(())
+        }
+        Some("remove") => {
+            let path = required_arg(&mut args, "path")?;
+            let marker_id = required_arg(&mut args, "marker-id")?;
+            no_extra_args(args)?;
+            let marker = daw_model::remove_marker(
+                path.as_ref(),
+                &daw_model::StableId::from_string(marker_id),
+            )
+            .map_err(|error| format!("failed to remove marker: {error}"))?;
+            println!("removed marker '{}'", marker.name);
+            Ok(())
+        }
+        Some("list") => {
+            let path = required_arg(&mut args, "path")?;
+            no_extra_args(args)?;
+            let project = daw_model::load_project(path.as_ref())
+                .map_err(|error| format!("failed to load project: {error}"))?;
+            if project.markers.is_empty() {
+                println!("markers: none");
+            } else {
+                for marker in project.markers {
+                    println!("{} {} {}", marker.id, marker.sample, marker.name);
+                }
+            }
+            Ok(())
+        }
+        Some(command) => Err(format!(
+            "unknown marker command: {command}\nrun `daw --help` for usage"
+        )),
+        None => Err("missing marker command\nrun `daw --help` for usage".to_owned()),
+    }
 }
 
 fn run_project(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -688,20 +755,29 @@ fn run_track(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             let path = required_arg(&mut args, "path")?;
             let track_id = required_arg(&mut args, "track-id")?;
             let volume_percent = required_u16(&mut args, "volume-percent")?;
-            let muted = required_bool(&mut args, "muted")?;
-            let solo = required_bool(&mut args, "solo")?;
+            let first = required_arg(&mut args, "pan-percent-or-muted")?;
+            let (pan_percent, muted, solo) = if let Ok(pan_percent) = first.parse::<i16>() {
+                let muted = required_bool(&mut args, "muted")?;
+                let solo = required_bool(&mut args, "solo")?;
+                (pan_percent, muted, solo)
+            } else {
+                let muted = parse_bool(&first, "muted")?;
+                let solo = required_bool(&mut args, "solo")?;
+                (0, muted, solo)
+            };
             no_extra_args(args)?;
             let track = daw_model::set_track_controls(
                 path.as_ref(),
                 &daw_model::StableId::from_string(track_id),
                 volume_percent,
+                pan_percent,
                 muted,
                 solo,
             )
             .map_err(|error| format!("failed to set track controls: {error}"))?;
             println!(
-                "set track '{}' controls: volume={} muted={} solo={}",
-                track.name, track.volume_percent, track.muted, track.solo
+                "set track '{}' controls: volume={} pan={} muted={} solo={}",
+                track.name, track.volume_percent, track.pan_percent, track.muted, track.solo
             );
             Ok(())
         }
@@ -787,6 +863,7 @@ fn print_named_list(label: &str, values: &[String]) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_project_buffer(
     project_path: &str,
     minimum_duration: f32,
@@ -884,11 +961,12 @@ fn render_project_buffer(
                 clip.fade_in_samples,
                 clip.fade_out_samples,
             );
-            daw_engine::mix_clip(
+            daw_engine::mix_clip_panned(
                 &mut output,
                 &limited,
                 destination_start,
                 combined_gain_percent(track.volume_percent, clip.gain_percent),
+                track.pan_percent,
                 track.muted,
             );
         }
@@ -921,14 +999,20 @@ fn print_help() {
     println!("  daw inspect <path>");
     println!("  daw project tempo <path> <tempo-bpm>");
     println!("  daw track add <path> <name>");
-    println!("  daw track controls <path> <track-id> <volume-percent> <muted> <solo>");
+    println!(
+        "  daw track controls <path> <track-id> <volume-percent> [pan-percent] <muted> <solo>"
+    );
     println!("  daw clip add <path> <track-id> <media-id> <start-sample> <duration-samples>");
     println!("  daw clip move <path> <clip-id> <start-sample> <duration-samples>");
     println!("  daw clip split <path> <clip-id> <split-sample>");
     println!("  daw clip duplicate <path> <clip-id> <start-sample> [track-id]");
     println!("  daw clip fade <path> <clip-id> <fade-in-samples> <fade-out-samples>");
     println!("  daw clip gain <path> <clip-id> <gain-percent>");
+    println!("  daw clip name <path> <clip-id> <name-or-clear>");
     println!("  daw clip remove <path> <clip-id>");
+    println!("  daw marker add <path> <sample> <name>");
+    println!("  daw marker remove <path> <marker-id>");
+    println!("  daw marker list <path>");
     println!("  daw snapshot create <path> [message]");
     println!("  daw branch create <path> <name>");
     println!("  daw branch list <path>");
@@ -1021,7 +1105,11 @@ fn required_u16(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u
 
 fn required_bool(args: &mut impl Iterator<Item = String>, name: &str) -> Result<bool, String> {
     let value = required_arg(args, name)?;
-    match value.as_str() {
+    parse_bool(&value, name)
+}
+
+fn parse_bool(value: &str, name: &str) -> Result<bool, String> {
+    match value {
         "true" | "yes" | "1" | "on" => Ok(true),
         "false" | "no" | "0" | "off" => Ok(false),
         _ => Err(format!("invalid {name}: expected true or false")),

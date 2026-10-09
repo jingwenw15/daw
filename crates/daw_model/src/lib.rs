@@ -54,6 +54,9 @@ pub struct Project {
     pub tracks: Vec<Track>,
     /// Media references known to the project.
     pub media: Vec<MediaReference>,
+    /// Timeline markers in sample order.
+    #[serde(default)]
+    pub markers: Vec<Marker>,
 }
 
 /// A timeline track.
@@ -66,6 +69,9 @@ pub struct Track {
     /// Linear volume percentage, where 100 is unity gain.
     #[serde(default = "default_track_volume_percent")]
     pub volume_percent: u16,
+    /// Stereo pan percentage from hard-left -100 to hard-right 100.
+    #[serde(default)]
+    pub pan_percent: i16,
     /// True when this track should be silent.
     #[serde(default)]
     pub muted: bool,
@@ -99,6 +105,9 @@ pub struct Clip {
     /// Linear clip gain percentage, where 100 is unity gain.
     #[serde(default = "default_clip_gain_percent")]
     pub gain_percent: u16,
+    /// Optional human-readable clip label.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// A media object referenced by the project.
@@ -110,6 +119,17 @@ pub struct MediaReference {
     pub content_hash: Option<String>,
     /// Original import path, retained for relinking.
     pub original_path: Option<String>,
+}
+
+/// A project timeline marker.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Marker {
+    /// Stable marker identifier.
+    pub id: StableId,
+    /// Timeline position in samples.
+    pub sample: u64,
+    /// Human-readable marker label.
+    pub name: String,
 }
 
 /// Stable text identifier used in serialized project documents.
@@ -196,6 +216,13 @@ pub enum ProjectCommand {
         /// Linear gain percentage.
         gain_percent: u16,
     },
+    /// Rename a timeline clip.
+    SetClipName {
+        /// Clip receiving the label.
+        clip_id: StableId,
+        /// Optional human-readable label.
+        name: Option<String>,
+    },
     /// Remove an existing clip from its track.
     RemoveClip {
         /// Clip to remove.
@@ -207,10 +234,23 @@ pub enum ProjectCommand {
         track_id: StableId,
         /// Linear volume percentage.
         volume_percent: u16,
+        /// Stereo pan percentage from -100 to 100.
+        #[serde(default)]
+        pan_percent: i16,
         /// True when this track should be silent.
         muted: bool,
         /// True when this track should be heard while non-soloed tracks are silent.
         solo: bool,
+    },
+    /// Add a project marker.
+    AddMarker {
+        /// Marker to add.
+        marker: Marker,
+    },
+    /// Remove a project marker.
+    RemoveMarker {
+        /// Marker to remove.
+        marker_id: StableId,
     },
     /// Replace current state with a stored snapshot.
     CheckoutSnapshot {
@@ -334,11 +374,13 @@ impl Project {
             tempo_bpm: default_project_tempo_bpm(),
             tracks: Vec::new(),
             media: Vec::new(),
+            markers: Vec::new(),
         }
     }
 
     /// Return all validation errors for this project.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Vec<ValidationError> {
         let mut errors = Vec::new();
 
@@ -370,6 +412,12 @@ impl Project {
                     track.id
                 )));
             }
+            if !(-100..=100).contains(&track.pan_percent) {
+                errors.push(ValidationError::new(format!(
+                    "track {} pan_percent must be between -100 and 100",
+                    track.id
+                )));
+            }
             for clip in &track.clips {
                 if clip.duration_samples == 0 {
                     errors.push(ValidationError::new(format!(
@@ -392,6 +440,16 @@ impl Project {
                 if clip.gain_percent > 200 {
                     errors.push(ValidationError::new(format!(
                         "clip {} gain_percent must be between 0 and 200",
+                        clip.id
+                    )));
+                }
+                if clip
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.trim().is_empty())
+                {
+                    errors.push(ValidationError::new(format!(
+                        "clip {} name must not be empty",
                         clip.id
                     )));
                 }
@@ -420,6 +478,22 @@ impl Project {
             errors.push(ValidationError::new("media IDs must be unique"));
         }
 
+        let mut marker_ids = Vec::with_capacity(self.markers.len());
+        for marker in &self.markers {
+            if marker.name.trim().is_empty() {
+                errors.push(ValidationError::new(format!(
+                    "marker {} name must not be empty",
+                    marker.id
+                )));
+            }
+            marker_ids.push(marker.id.clone());
+        }
+        marker_ids.sort();
+        marker_ids.dedup();
+        if marker_ids.len() != self.markers.len() {
+            errors.push(ValidationError::new("marker IDs must be unique"));
+        }
+
         errors
     }
 
@@ -443,6 +517,7 @@ impl Track {
             id: StableId::new(),
             name: name.into(),
             volume_percent: default_track_volume_percent(),
+            pan_percent: 0,
             muted: false,
             solo: false,
             clips: Vec::new(),
@@ -539,17 +614,26 @@ impl ProjectCommand {
                 clip_id,
                 gain_percent,
             } => format!("set clip {clip_id} gain={gain_percent}"),
+            Self::SetClipName { clip_id, name } => {
+                let name = name.as_deref().unwrap_or("none");
+                format!("set clip {clip_id} name='{name}'")
+            }
             Self::RemoveClip { clip_id } => format!("remove clip {clip_id}"),
             Self::SetTrackControls {
                 track_id,
                 volume_percent,
+                pan_percent,
                 muted,
                 solo,
             } => {
                 format!(
-                    "set track {track_id} controls volume={volume_percent} muted={muted} solo={solo}"
+                    "set track {track_id} controls volume={volume_percent} pan={pan_percent} muted={muted} solo={solo}"
                 )
             }
+            Self::AddMarker { marker } => {
+                format!("add marker '{}' at {}", marker.name, marker.sample)
+            }
+            Self::RemoveMarker { marker_id } => format!("remove marker {marker_id}"),
             Self::CheckoutSnapshot { snapshot_id } => {
                 format!("checkout snapshot {snapshot_id}")
             }
@@ -891,6 +975,7 @@ pub fn add_clip(
         fade_in_samples: 0,
         fade_out_samples: 0,
         gain_percent: default_clip_gain_percent(),
+        name: None,
     };
     append_and_apply(
         project_dir,
@@ -1052,6 +1137,30 @@ pub fn set_clip_gain(
         .ok_or_else(|| unknown_clip_error(clip_id))
 }
 
+/// Set or clear a human-readable clip label.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the clip is unknown, or
+/// the label is invalid.
+pub fn set_clip_name(
+    project_dir: &Path,
+    clip_id: &StableId,
+    name: Option<&str>,
+) -> Result<Clip, ProjectIoError> {
+    append_and_apply(
+        project_dir,
+        ProjectCommand::SetClipName {
+            clip_id: clip_id.clone(),
+            name: name.map(ToOwned::to_owned),
+        },
+    )?;
+    let project = load_project(project_dir)?;
+    find_clip(&project, clip_id)
+        .cloned()
+        .ok_or_else(|| unknown_clip_error(clip_id))
+}
+
 /// Duplicate an existing clip at a new timeline start, optionally on another track.
 ///
 /// # Errors
@@ -1082,6 +1191,7 @@ pub fn duplicate_clip(
         fade_in_samples: source.fade_in_samples,
         fade_out_samples: source.fade_out_samples,
         gain_percent: source.gain_percent,
+        name: source.name,
     };
     append_and_apply(
         project_dir,
@@ -1185,6 +1295,7 @@ pub fn set_track_controls(
     project_dir: &Path,
     track_id: &StableId,
     volume_percent: u16,
+    pan_percent: i16,
     muted: bool,
     solo: bool,
 ) -> Result<Track, ProjectIoError> {
@@ -1193,6 +1304,7 @@ pub fn set_track_controls(
         ProjectCommand::SetTrackControls {
             track_id: track_id.clone(),
             volume_percent,
+            pan_percent,
             muted,
             solo,
         },
@@ -1207,6 +1319,49 @@ pub fn set_track_controls(
                 "unknown track id {track_id}"
             ))])
         })
+}
+
+/// Add a timeline marker through the command log.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded or updated.
+pub fn add_marker(project_dir: &Path, sample: u64, name: &str) -> Result<Marker, ProjectIoError> {
+    let marker = Marker {
+        id: StableId::new(),
+        sample,
+        name: name.to_owned(),
+    };
+    append_and_apply(
+        project_dir,
+        ProjectCommand::AddMarker {
+            marker: marker.clone(),
+        },
+    )?;
+    Ok(marker)
+}
+
+/// Remove a timeline marker through the command log.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the marker is unknown, or
+/// the updated project cannot be saved.
+pub fn remove_marker(project_dir: &Path, marker_id: &StableId) -> Result<Marker, ProjectIoError> {
+    let project = load_project(project_dir)?;
+    let removed = project
+        .markers
+        .iter()
+        .find(|marker| marker.id == *marker_id)
+        .cloned()
+        .ok_or_else(|| unknown_marker_error(marker_id))?;
+    append_and_apply(
+        project_dir,
+        ProjectCommand::RemoveMarker {
+            marker_id: marker_id.clone(),
+        },
+    )?;
+    Ok(removed)
 }
 
 /// Create a branch from the current project state.
@@ -1510,13 +1665,26 @@ fn apply_command(
             clip_id,
             gain_percent,
         } => apply_set_clip_gain(project, clip_id, *gain_percent),
+        ProjectCommand::SetClipName { clip_id, name } => {
+            apply_set_clip_name(project, clip_id, name.as_deref())
+        }
         ProjectCommand::RemoveClip { clip_id } => apply_remove_clip(project, clip_id),
         ProjectCommand::SetTrackControls {
             track_id,
             volume_percent,
+            pan_percent,
             muted,
             solo,
-        } => apply_set_track_controls(project, track_id, *volume_percent, *muted, *solo),
+        } => apply_set_track_controls(
+            project,
+            track_id,
+            *volume_percent,
+            *pan_percent,
+            *muted,
+            *solo,
+        ),
+        ProjectCommand::AddMarker { marker } => apply_add_marker(project, marker),
+        ProjectCommand::RemoveMarker { marker_id } => apply_remove_marker(project, marker_id),
         ProjectCommand::CheckoutSnapshot { snapshot_id } => {
             Ok(load_snapshot(project_dir, snapshot_id)?.project)
         }
@@ -1606,6 +1774,7 @@ fn apply_split_clip(
         fade_in_samples: 0,
         fade_out_samples: clip.fade_out_samples.min(right_duration),
         gain_percent: clip.gain_percent,
+        name: clip.name,
     };
     project.tracks[track_index].clips.push(right);
     sort_track_clips(&mut project);
@@ -1631,6 +1800,16 @@ fn apply_set_clip_gain(
 ) -> Result<Project, ProjectIoError> {
     let clip = find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?;
     clip.gain_percent = gain_percent;
+    validate_project_state(project)
+}
+
+fn apply_set_clip_name(
+    mut project: Project,
+    clip_id: &StableId,
+    name: Option<&str>,
+) -> Result<Project, ProjectIoError> {
+    let clip = find_clip_mut(&mut project, clip_id).ok_or_else(|| unknown_clip_error(clip_id))?;
+    clip.name = name.map(ToOwned::to_owned);
     validate_project_state(project)
 }
 
@@ -1719,6 +1898,7 @@ fn apply_set_track_controls(
     mut project: Project,
     track_id: &StableId,
     volume_percent: u16,
+    pan_percent: i16,
     muted: bool,
     solo: bool,
 ) -> Result<Project, ProjectIoError> {
@@ -1728,8 +1908,27 @@ fn apply_set_track_controls(
         .find(|track| track.id == *track_id)
         .ok_or_else(|| unknown_track_error(track_id))?;
     track.volume_percent = volume_percent;
+    track.pan_percent = pan_percent;
     track.muted = muted;
     track.solo = solo;
+    validate_project_state(project)
+}
+
+fn apply_add_marker(mut project: Project, marker: &Marker) -> Result<Project, ProjectIoError> {
+    project.markers.push(marker.clone());
+    project.markers.sort_by_key(|marker| marker.sample);
+    validate_project_state(project)
+}
+
+fn apply_remove_marker(
+    mut project: Project,
+    marker_id: &StableId,
+) -> Result<Project, ProjectIoError> {
+    let marker_count = project.markers.len();
+    project.markers.retain(|marker| marker.id != *marker_id);
+    if project.markers.len() == marker_count {
+        return Err(unknown_marker_error(marker_id));
+    }
     validate_project_state(project)
 }
 
@@ -1751,6 +1950,12 @@ fn unknown_track_error(track_id: &StableId) -> ProjectIoError {
 fn unknown_clip_error(clip_id: &StableId) -> ProjectIoError {
     ProjectIoError::Invalid(vec![ValidationError::new(format!(
         "unknown clip id {clip_id}"
+    ))])
+}
+
+fn unknown_marker_error(marker_id: &StableId) -> ProjectIoError {
+    ProjectIoError::Invalid(vec![ValidationError::new(format!(
+        "unknown marker id {marker_id}"
     ))])
 }
 
@@ -1944,13 +2149,13 @@ fn default_project_tempo_bpm() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_clip, add_media_reference, add_track, checkout_snapshot, create_branch,
+        add_clip, add_marker, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, duplicate_clip, init_project, list_branches, load_project,
-        merge_branch, project_file_path, redo_project, remove_clip, remove_track, replay_project,
-        set_clip_fades, set_clip_gain, set_clip_placement, set_clip_placement_on_track,
-        set_clip_timing_on_track, set_project_tempo, set_track_controls, set_track_name,
-        split_clip, switch_branch, undo_project, Project, ProjectIoError, StableId, Track,
-        DEFAULT_TEMPO_BPM, PROJECT_SCHEMA_VERSION,
+        merge_branch, project_file_path, redo_project, remove_clip, remove_marker, remove_track,
+        replay_project, set_clip_fades, set_clip_gain, set_clip_name, set_clip_placement,
+        set_clip_placement_on_track, set_clip_timing_on_track, set_project_tempo,
+        set_track_controls, set_track_name, split_clip, switch_branch, undo_project, Project,
+        ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM, PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -1970,18 +2175,20 @@ mod tests {
                 id: StableId::from_string("track-id"),
                 name: "Drums".to_owned(),
                 volume_percent: 100,
+                pan_percent: 0,
                 muted: false,
                 solo: false,
                 clips: Vec::new(),
             }],
             media: Vec::new(),
+            markers: Vec::new(),
         };
 
         let json = project.to_canonical_json().expect("serialize project");
 
         assert_eq!(
             json,
-            "{\n  \"schema_version\": 1,\n  \"id\": \"project-id\",\n  \"name\": \"Session\",\n  \"tempo_bpm\": 120,\n  \"tracks\": [\n    {\n      \"id\": \"track-id\",\n      \"name\": \"Drums\",\n      \"volume_percent\": 100,\n      \"muted\": false,\n      \"solo\": false,\n      \"clips\": []\n    }\n  ],\n  \"media\": []\n}\n"
+            "{\n  \"schema_version\": 1,\n  \"id\": \"project-id\",\n  \"name\": \"Session\",\n  \"tempo_bpm\": 120,\n  \"tracks\": [\n    {\n      \"id\": \"track-id\",\n      \"name\": \"Drums\",\n      \"volume_percent\": 100,\n      \"pan_percent\": 0,\n      \"muted\": false,\n      \"solo\": false,\n      \"clips\": []\n    }\n  ],\n  \"media\": [],\n  \"markers\": []\n}\n"
         );
     }
 
@@ -1998,6 +2205,7 @@ mod tests {
                     id: duplicate_id.clone(),
                     name: "A".to_owned(),
                     volume_percent: 100,
+                    pan_percent: 0,
                     muted: false,
                     solo: false,
                     clips: Vec::new(),
@@ -2006,12 +2214,14 @@ mod tests {
                     id: duplicate_id,
                     name: "B".to_owned(),
                     volume_percent: 100,
+                    pan_percent: 0,
                     muted: false,
                     solo: false,
                     clips: Vec::new(),
                 },
             ],
             media: Vec::new(),
+            markers: Vec::new(),
         };
 
         let errors = project.validate();
@@ -2155,12 +2365,13 @@ mod tests {
         init_project(&project_dir, "Mixer").expect("init project");
         let track = add_track(&project_dir, "Lead").expect("add track");
 
-        let updated =
-            set_track_controls(&project_dir, &track.id, 75, true, false).expect("set controls");
+        let updated = set_track_controls(&project_dir, &track.id, 75, -25, true, false)
+            .expect("set controls");
         let project = load_project(&project_dir).expect("load project");
         let replayed = replay_project(&project_dir).expect("replay project");
 
         assert_eq!(updated.volume_percent, 75);
+        assert_eq!(updated.pan_percent, -25);
         assert!(updated.muted);
         assert!(!updated.solo);
         assert_eq!(project.tracks[0], updated);
@@ -2307,6 +2518,43 @@ mod tests {
         let result = set_clip_gain(&project_dir, &clip.id, 201);
 
         assert!(matches!(result, Err(ProjectIoError::Invalid(_))));
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn sets_clip_name_through_command_log() {
+        let project_dir = temp_project_dir("clip-name");
+        init_project(&project_dir, "Clip Name").expect("init project");
+        let track = add_track(&project_dir, "Audio").expect("add track");
+        let media = add_media_reference(&project_dir, "abc123", Some("/tmp/source.wav".to_owned()))
+            .expect("add media");
+        let clip = add_clip(&project_dir, &track.id, &media.id, 48_000, 24_000).expect("add clip");
+
+        let named = set_clip_name(&project_dir, &clip.id, Some("Hook")).expect("set clip name");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(named.name.as_deref(), Some("Hook"));
+        assert_eq!(project.tracks[0].clips, vec![named]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn adds_and_removes_markers_through_command_log() {
+        let project_dir = temp_project_dir("markers");
+        init_project(&project_dir, "Markers").expect("init project");
+
+        let intro = add_marker(&project_dir, 96_000, "Intro").expect("add marker");
+        let bridge = add_marker(&project_dir, 48_000, "Bridge").expect("add marker");
+        remove_marker(&project_dir, &intro.id).expect("remove marker");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(project.markers, vec![bridge]);
+        assert_eq!(replayed, project);
+
         fs::remove_dir_all(project_dir).expect("cleanup project");
     }
 
