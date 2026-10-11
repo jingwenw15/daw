@@ -806,6 +806,20 @@ fn run_track(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("move") => {
+            let path = required_arg(&mut args, "path")?;
+            let track_id = required_arg(&mut args, "track-id")?;
+            let target_index = required_usize(&mut args, "target-index")?;
+            no_extra_args(args)?;
+            let project = daw_model::move_track(
+                path.as_ref(),
+                &daw_model::StableId::from_string(track_id),
+                target_index,
+            )
+            .map_err(|error| format!("failed to move track: {error}"))?;
+            println!("moved track; project has {} tracks", project.tracks.len());
+            Ok(())
+        }
         Some(command) => Err(format!(
             "unknown track command: {command}\nrun `daw --help` for usage"
         )),
@@ -1044,6 +1058,7 @@ fn print_help() {
     println!(
         "  daw track controls <path> <track-id> <volume-percent> [pan-percent] <muted> <solo>"
     );
+    println!("  daw track move <path> <track-id> <target-index>");
     println!("  daw clip add <path> <track-id> <media-id> <start-sample> <duration-samples>");
     println!("  daw clip move <path> <clip-id> <start-sample> <duration-samples>");
     println!("  daw clip split <path> <clip-id> <split-sample>");
@@ -1143,6 +1158,12 @@ fn required_u64(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u
 fn required_u16(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u16, String> {
     required_arg(args, name)?
         .parse::<u16>()
+        .map_err(|error| format!("invalid {name}: {error}"))
+}
+
+fn required_usize(args: &mut impl Iterator<Item = String>, name: &str) -> Result<usize, String> {
+    required_arg(args, name)?
+        .parse::<usize>()
         .map_err(|error| format!("invalid {name}: {error}"))
 }
 

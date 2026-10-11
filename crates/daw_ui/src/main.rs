@@ -216,6 +216,10 @@ enum ArrangementAction {
     SetClipSelection(BTreeSet<daw_model::StableId>),
     ArmTrack(daw_model::StableId),
     RemoveTrack(daw_model::StableId),
+    MoveTrack {
+        track_id: daw_model::StableId,
+        direction: i32,
+    },
     RenameTrack {
         track_id: daw_model::StableId,
         name: String,
@@ -412,6 +416,9 @@ impl DawApp {
                 if ui.button("Add Marker").clicked() {
                     self.add_marker_at_playhead();
                 }
+                if ui.button("Remove Marker").clicked() {
+                    self.remove_marker_at_playhead();
+                }
                 if ui.button("Prev Marker").clicked() {
                     self.seek_previous_marker();
                 }
@@ -507,6 +514,7 @@ impl DawApp {
             });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_edit_toolbar(&mut self, ui: &mut egui::Ui) {
         let has_project = self.project.is_some();
         let selected_count = self.selected_clip_ids.len();
@@ -554,6 +562,34 @@ impl DawApp {
             .clicked()
         {
             self.duplicate_selected_clip();
+        }
+        if ui
+            .add_enabled(has_clip, egui::Button::new("Nudge -"))
+            .on_hover_text("Left Arrow")
+            .clicked()
+        {
+            self.nudge_selected_clips(-1);
+        }
+        if ui
+            .add_enabled(has_clip, egui::Button::new("Nudge +"))
+            .on_hover_text("Right Arrow")
+            .clicked()
+        {
+            self.nudge_selected_clips(1);
+        }
+        if ui
+            .add_enabled(has_clip, egui::Button::new("Quantize"))
+            .on_hover_text("Q")
+            .clicked()
+        {
+            self.quantize_selected_clips();
+        }
+        if ui
+            .add_enabled(has_project, egui::Button::new("Select All"))
+            .on_hover_text("Cmd+A")
+            .clicked()
+        {
+            self.select_all_clips();
         }
         if ui
             .add_enabled(has_clip, egui::Button::new("Copy"))
@@ -1279,6 +1315,10 @@ impl DawApp {
                 self.status = format!("Armed track {track_id}");
             }
             ArrangementAction::RemoveTrack(track_id) => self.remove_track(track_id),
+            ArrangementAction::MoveTrack {
+                track_id,
+                direction,
+            } => self.move_track(track_id, *direction),
             ArrangementAction::RenameTrack { track_id, name } => {
                 self.rename_track(track_id, name);
             }
@@ -1450,6 +1490,7 @@ impl DawApp {
         self.edit_clip_id.clear();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if self.clip_drag.is_some() {
             return;
@@ -1473,6 +1514,13 @@ impl DawApp {
         });
         if copy_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
             self.copy_selected_clips();
+            return;
+        }
+        let select_all_pressed = ctx.input(|input| {
+            input.modifiers.command && !input.modifiers.shift && input.key_pressed(egui::Key::A)
+        });
+        if select_all_pressed && !ctx.wants_keyboard_input() && self.project.is_some() {
+            self.select_all_clips();
             return;
         }
         let paste_pressed = ctx.input(|input| {
@@ -1524,6 +1572,27 @@ impl DawApp {
         });
         if duplicate_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
             self.duplicate_selected_clip();
+            return;
+        }
+        let quantize_pressed = ctx.input(|input| {
+            !input.modifiers.command
+                && !input.modifiers.shift
+                && !input.modifiers.alt
+                && !input.modifiers.ctrl
+                && input.key_pressed(egui::Key::Q)
+        });
+        if quantize_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
+            self.quantize_selected_clips();
+            return;
+        }
+        let left_pressed = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
+        if left_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
+            self.nudge_selected_clips(-1);
+            return;
+        }
+        let right_pressed = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
+        if right_pressed && !ctx.wants_keyboard_input() && !self.selected_clip_ids.is_empty() {
+            self.nudge_selected_clips(1);
             return;
         }
         let enter_pressed = ctx.input(|input| input.key_pressed(egui::Key::Enter));
@@ -1883,6 +1952,83 @@ impl DawApp {
         self.refresh_project_after_edit(format!("Pasted {} clip(s)", pasted.len()));
     }
 
+    fn edit_step_samples(&self) -> u64 {
+        self.timeline_grid()
+            .snap
+            .filter(|samples| *samples > 0)
+            .unwrap_or_else(|| samples_per_beat(self.project_tempo_bpm))
+            .max(1)
+    }
+
+    fn nudge_selected_clips(&mut self, direction: i32) {
+        if self.selected_clip_ids.is_empty() {
+            "No clip selected".clone_into(&mut self.status);
+            return;
+        }
+        let Some(project) = &self.project else {
+            "Open a project before nudging clips".clone_into(&mut self.status);
+            return;
+        };
+        let step = self.edit_step_samples();
+        let selected = selected_clip_locations(project, &self.selected_clip_ids);
+        let requests = selected
+            .into_iter()
+            .map(|clip| {
+                let start_sample = if direction < 0 {
+                    clip.original_start_sample.saturating_sub(step)
+                } else {
+                    clip.original_start_sample.saturating_add(step)
+                };
+                ClipMoveRequest {
+                    clip_id: clip.clip_id,
+                    track_id: clip.track_id,
+                    start_sample,
+                    source_start_sample: clip.source_start_sample,
+                    duration_samples: clip.duration_samples,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.commit_clip_moves(&requests);
+    }
+
+    fn quantize_selected_clips(&mut self) {
+        if self.selected_clip_ids.is_empty() {
+            "No clip selected".clone_into(&mut self.status);
+            return;
+        }
+        let Some(project) = &self.project else {
+            "Open a project before quantizing clips".clone_into(&mut self.status);
+            return;
+        };
+        let grid = Some(self.edit_step_samples());
+        let selected = selected_clip_locations(project, &self.selected_clip_ids);
+        let requests = selected
+            .into_iter()
+            .map(|clip| ClipMoveRequest {
+                clip_id: clip.clip_id,
+                track_id: clip.track_id,
+                start_sample: snap_sample(clip.original_start_sample, grid),
+                source_start_sample: clip.source_start_sample,
+                duration_samples: clip.duration_samples,
+            })
+            .collect::<Vec<_>>();
+        self.commit_clip_moves(&requests);
+    }
+
+    fn select_all_clips(&mut self) {
+        let Some(project) = &self.project else {
+            "Open a project before selecting clips".clone_into(&mut self.status);
+            return;
+        };
+        self.selected_clip_ids = project
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .map(|clip| clip.id.clone())
+            .collect();
+        self.status = format!("Selected {} clip(s)", self.selected_clip_ids.len());
+    }
+
     fn remove_track(&mut self, track_id: &daw_model::StableId) {
         let path = PathBuf::from(&self.project_path);
         match daw_model::remove_track(&path, track_id) {
@@ -1895,6 +2041,39 @@ impl DawApp {
                 self.refresh_project_after_edit(format!("Removed track '{}'", track.name));
             }
             Err(error) => self.status = format!("Remove track failed: {error}"),
+        }
+    }
+
+    fn move_track(&mut self, track_id: &daw_model::StableId, direction: i32) {
+        let Some(project) = &self.project else {
+            "Open a project before moving tracks".clone_into(&mut self.status);
+            return;
+        };
+        let Some(index) = project
+            .tracks
+            .iter()
+            .position(|track| track.id == *track_id)
+        else {
+            self.status = format!("Unknown track {track_id}");
+            return;
+        };
+        let target_index = if direction < 0 {
+            index.saturating_sub(1)
+        } else {
+            (index + 1).min(project.tracks.len().saturating_sub(1))
+        };
+        if target_index == index {
+            "Track is already at that edge".clone_into(&mut self.status);
+            return;
+        }
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::move_track(&path, track_id, target_index) {
+            Ok(project) => self.refresh_project_after_edit(format!(
+                "Moved track to position {} of {}",
+                target_index + 1,
+                project.tracks.len()
+            )),
+            Err(error) => self.status = format!("Move track failed: {error}"),
         }
     }
 
@@ -1935,6 +2114,38 @@ impl DawApp {
                 marker.name, marker.sample
             )),
             Err(error) => self.status = format!("Add marker failed: {error}"),
+        }
+    }
+
+    fn remove_marker_at_playhead(&mut self) {
+        let Some(project) = &self.project else {
+            "Open a project before removing markers".clone_into(&mut self.status);
+            return;
+        };
+        let playhead = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let tolerance = self.edit_step_samples() / 2;
+        let Some(marker) = project
+            .markers
+            .iter()
+            .filter(|marker| marker.sample.abs_diff(playhead) <= tolerance)
+            .min_by_key(|marker| marker.sample.abs_diff(playhead))
+            .cloned()
+        else {
+            "No marker near the playhead".clone_into(&mut self.status);
+            return;
+        };
+        let path = PathBuf::from(&self.project_path);
+        match daw_model::remove_marker(&path, &marker.id) {
+            Ok(marker) => {
+                self.refresh_project_after_edit(format!("Removed marker '{}'", marker.name));
+            }
+            Err(error) => self.status = format!("Remove marker failed: {error}"),
         }
     }
 
@@ -2597,10 +2808,24 @@ fn render_track_header_controls(
     );
     let remove_response = ui.put(
         egui::Rect::from_min_size(
-            header_rect.left_top() + egui::vec2(202.0, 58.0),
-            egui::vec2(42.0, 24.0),
+            header_rect.left_top() + egui::vec2(222.0, 58.0),
+            egui::vec2(28.0, 24.0),
         ),
         egui::Button::new("Del").fill(egui::Color32::from_rgb(68, 48, 52)),
+    );
+    let up_response = ui.put(
+        egui::Rect::from_min_size(
+            header_rect.left_top() + egui::vec2(158.0, 58.0),
+            egui::vec2(26.0, 24.0),
+        ),
+        egui::Button::new("Up"),
+    );
+    let down_response = ui.put(
+        egui::Rect::from_min_size(
+            header_rect.left_top() + egui::vec2(190.0, 58.0),
+            egui::vec2(28.0, 24.0),
+        ),
+        egui::Button::new("Dn"),
     );
     draw_track_meter(
         &painter,
@@ -2631,6 +2856,18 @@ fn render_track_header_controls(
     }
     if remove_response.clicked() {
         return Some(ArrangementAction::RemoveTrack(track.id.clone()));
+    }
+    if up_response.clicked() {
+        return Some(ArrangementAction::MoveTrack {
+            track_id: track.id.clone(),
+            direction: -1,
+        });
+    }
+    if down_response.clicked() {
+        return Some(ArrangementAction::MoveTrack {
+            track_id: track.id.clone(),
+            direction: 1,
+        });
     }
     let controls_changed = volume_response.changed() || pan_response.changed();
     if controls_changed || muted != track.muted || solo != track.solo {

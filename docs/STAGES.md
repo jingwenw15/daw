@@ -675,3 +675,58 @@ not focused.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 56
+
+Selected clips can be nudged by the current edit grid. The edit toolbar exposes
+Nudge - and Nudge + controls, and left/right arrow shortcuts move all selected
+clips while preserving track, source offset, and duration.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 57
+
+Selected clips can be quantized to the active snap grid. The edit toolbar adds a
+Quantize action, and `Q` applies the same operation when text fields are not
+focused.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 58
+
+The arrangement can select every clip in the project. The edit toolbar exposes
+Select All and Cmd+A selects all clips when the timeline has keyboard focus.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 59
+
+Tracks can be reordered through the project command log. The CLI exposes
+`track move`, and native track headers include Up and Down controls that move
+tracks while preserving their clips and mixer settings.
+
+```sh
+cargo run --bin daw -- track move /tmp/my-session <track-id> <target-index>
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 60
+
+Markers can be removed from the native transport without opening advanced tools.
+Remove Marker deletes the nearest marker within half of the current edit step
+from the playhead.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

@@ -157,6 +157,13 @@ pub enum ProjectCommand {
         /// New human-readable track name.
         name: String,
     },
+    /// Move a track to a new timeline index.
+    MoveTrack {
+        /// Track to move.
+        track_id: StableId,
+        /// Target zero-based track index.
+        target_index: usize,
+    },
     /// Set the project tempo.
     SetProjectTempo {
         /// Quarter-note beats per minute.
@@ -577,6 +584,10 @@ impl ProjectCommand {
             Self::SetTrackName { track_id, name } => {
                 format!("rename track {track_id} to '{name}'")
             }
+            Self::MoveTrack {
+                track_id,
+                target_index,
+            } => format!("move track {track_id} to index {target_index}"),
             Self::SetProjectTempo { tempo_bpm } => format!("set project tempo to {tempo_bpm} BPM"),
             Self::AddMediaReference { media } => {
                 format!(
@@ -931,6 +942,26 @@ pub fn set_track_name(
         .into_iter()
         .find(|track| track.id == *track_id)
         .ok_or_else(|| unknown_track_error(track_id))
+}
+
+/// Move a track to a new timeline index through the command log.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the track is unknown, the
+/// target index is invalid, or the updated project cannot be saved.
+pub fn move_track(
+    project_dir: &Path,
+    track_id: &StableId,
+    target_index: usize,
+) -> Result<Project, ProjectIoError> {
+    append_and_apply(
+        project_dir,
+        ProjectCommand::MoveTrack {
+            track_id: track_id.clone(),
+            target_index,
+        },
+    )
 }
 
 /// Set project tempo through the command log.
@@ -1662,6 +1693,10 @@ fn apply_command(
         ProjectCommand::SetTrackName { track_id, name } => {
             apply_set_track_name(project, track_id, name)
         }
+        ProjectCommand::MoveTrack {
+            track_id,
+            target_index,
+        } => apply_move_track(project, track_id, *target_index),
         ProjectCommand::SetProjectTempo { tempo_bpm } => {
             project.tempo_bpm = *tempo_bpm;
             validate_project_state(project)
@@ -1926,6 +1961,26 @@ fn apply_set_track_name(
         .find(|track| track.id == *track_id)
         .ok_or_else(|| unknown_track_error(track_id))?;
     name.clone_into(&mut track.name);
+    validate_project_state(project)
+}
+
+fn apply_move_track(
+    mut project: Project,
+    track_id: &StableId,
+    target_index: usize,
+) -> Result<Project, ProjectIoError> {
+    if target_index >= project.tracks.len() {
+        return Err(ProjectIoError::Invalid(vec![ValidationError::new(
+            format!("target track index {target_index} is out of range"),
+        )]));
+    }
+    let source_index = project
+        .tracks
+        .iter()
+        .position(|track| track.id == *track_id)
+        .ok_or_else(|| unknown_track_error(track_id))?;
+    let track = project.tracks.remove(source_index);
+    project.tracks.insert(target_index, track);
     validate_project_state(project)
 }
 
@@ -2215,11 +2270,12 @@ mod tests {
     use super::{
         add_clip, add_marker, add_media_reference, add_track, checkout_snapshot, create_branch,
         create_snapshot, diff, duplicate_clip, init_project, list_branches, load_project,
-        merge_branch, project_file_path, redo_project, remove_clip, remove_marker, remove_track,
-        replay_project, set_clip_fades, set_clip_gain, set_clip_name, set_clip_placement,
-        set_clip_placement_on_track, set_clip_timing_on_track, set_marker, set_project_tempo,
-        set_track_controls, set_track_name, split_clip, switch_branch, undo_project, Project,
-        ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM, PROJECT_SCHEMA_VERSION,
+        merge_branch, move_track, project_file_path, redo_project, remove_clip, remove_marker,
+        remove_track, replay_project, set_clip_fades, set_clip_gain, set_clip_name,
+        set_clip_placement, set_clip_placement_on_track, set_clip_timing_on_track, set_marker,
+        set_project_tempo, set_track_controls, set_track_name, split_clip, switch_branch,
+        undo_project, Project, ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM,
+        PROJECT_SCHEMA_VERSION,
     };
     use std::{fs, path::PathBuf};
 
@@ -2456,6 +2512,25 @@ mod tests {
 
         assert_eq!(updated.name, "Vocals");
         assert_eq!(project.tracks[0].name, "Vocals");
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn moves_track_through_command_log() {
+        let project_dir = temp_project_dir("track-order");
+        init_project(&project_dir, "Track Order").expect("init project");
+        let drums = add_track(&project_dir, "Drums").expect("add drums");
+        let bass = add_track(&project_dir, "Bass").expect("add bass");
+        let vocals = add_track(&project_dir, "Vocals").expect("add vocals");
+
+        let moved = move_track(&project_dir, &vocals.id, 0).expect("move vocals");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(moved.tracks, vec![vocals, drums, bass]);
+        assert_eq!(project, moved);
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");
