@@ -618,3 +618,60 @@ volume, pan, mute, solo, and optional metronome mixing.
 cargo test
 cargo run --bin daw-ui
 ```
+
+## Stage 51
+
+Timeline markers can be edited after creation. The project model has a replayable
+marker update command, and the CLI can move or rename markers without deleting
+their stable IDs.
+
+```sh
+cargo run --bin daw -- marker set /tmp/my-session <marker-id> <sample> <name>
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 52
+
+The native transport can navigate markers. Previous Marker and Next Marker move
+the playhead to neighboring marker positions, wrapping at the ends of the marker
+list for quick arrangement navigation.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 53
+
+Loop regions can be set from surrounding markers. With the playhead between two
+markers, Loop Markers enables loop playback and sets loop start/end to the
+neighboring marker samples.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 54
+
+Project rendering can target an exact sample range. The CLI accepts an optional
+end sample for `render-project`, and the native export button now exports the
+active loop range when loop mode is enabled.
+
+```sh
+cargo run --bin daw -- render-project /tmp/my-session /tmp/mix.wav 1.0 <start-sample> <end-sample>
+cargo test
+cargo run --bin daw-ui
+```
+
+## Stage 55
+
+Marker workflows have first-pass keyboard support. Press `M` to add a marker at
+the playhead and `L` to set a loop from surrounding markers when text fields are
+not focused.
+
+```sh
+cargo test
+cargo run --bin daw-ui
+```

@@ -210,7 +210,7 @@ fn run_play_project(mut args: impl Iterator<Item = String>) -> Result<(), String
     let duration = optional_f32(args.next(), 1.0, "minimum-duration-seconds")?;
     let start_sample = optional_u64(args.next(), 0, "start-sample")?;
     no_extra_args(args)?;
-    let buffer = render_project_buffer(&project_path, duration, start_sample)?;
+    let buffer = render_project_buffer(&project_path, duration, start_sample, None)?;
     let hold_seconds = frames_to_seconds(buffer.frames(), buffer.sample_rate) + 0.10;
     let report = daw_engine::play_buffer(buffer, hold_seconds)
         .map_err(|error| format!("failed to play project: {error}"))?;
@@ -270,8 +270,16 @@ fn run_render_project(mut args: impl Iterator<Item = String>) -> Result<(), Stri
     let output = required_arg(&mut args, "output")?;
     let duration = optional_f32(args.next(), 1.0, "duration-seconds")?;
     let start_sample = optional_u64(args.next(), 0, "start-sample")?;
+    let end_sample = args
+        .next()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| format!("invalid end-sample: {error}"))
+        })
+        .transpose()?;
     no_extra_args(args)?;
-    let buffer = render_project_buffer(&project_path, duration, start_sample)?;
+    let buffer = render_project_buffer(&project_path, duration, start_sample, end_sample)?;
     daw_engine::write_wav(output.as_ref(), &buffer)
         .map_err(|error| format!("failed to write project render: {error}"))?;
     println!(
@@ -385,6 +393,7 @@ fn run_media(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     match args.next().as_deref() {
         Some("add") => {
@@ -473,6 +482,22 @@ fn run_clip(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             )
             .map_err(|error| format!("failed to remove clip: {error}"))?;
             println!("removed clip {}", clip.id);
+            Ok(())
+        }
+        Some("set") => {
+            let path = required_arg(&mut args, "path")?;
+            let marker_id = required_arg(&mut args, "marker-id")?;
+            let sample = required_u64(&mut args, "sample")?;
+            let name = required_arg(&mut args, "name")?;
+            no_extra_args(args)?;
+            let marker = daw_model::set_marker(
+                path.as_ref(),
+                &daw_model::StableId::from_string(marker_id),
+                sample,
+                &name,
+            )
+            .map_err(|error| format!("failed to set marker: {error}"))?;
+            println!("set marker '{}' at {}", marker.name, marker.sample);
             Ok(())
         }
         Some(command) => Err(format!(
@@ -868,19 +893,30 @@ fn render_project_buffer(
     project_path: &str,
     minimum_duration: f32,
     start_sample: u64,
+    end_sample: Option<u64>,
 ) -> Result<daw_engine::AudioBuffer, String> {
     let project = daw_model::load_project(project_path.as_ref())
         .map_err(|error| format!("project is invalid: {error}"))?;
     let media_objects = daw_media::list_media(project_path.as_ref())
         .map_err(|error| format!("failed to list media: {error}"))?;
-    let mut total_frames = duration_to_frames(minimum_duration, daw_engine::DEFAULT_SAMPLE_RATE)?;
-    for track in &project.tracks {
-        for clip in &track.clips {
-            let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
-            if clip_end > start_sample {
-                let relative_end = usize::try_from(clip_end - start_sample)
-                    .map_err(|_| "clip timeline position is too large".to_owned())?;
-                total_frames = total_frames.max(relative_end);
+    let mut total_frames = if let Some(end_sample) = end_sample {
+        if end_sample <= start_sample {
+            return Err("end-sample must be greater than start-sample".to_owned());
+        }
+        usize::try_from(end_sample - start_sample)
+            .map_err(|_| "render timeline span is too large".to_owned())?
+    } else {
+        duration_to_frames(minimum_duration, daw_engine::DEFAULT_SAMPLE_RATE)?
+    };
+    if end_sample.is_none() {
+        for track in &project.tracks {
+            for clip in &track.clips {
+                let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+                if clip_end > start_sample {
+                    let relative_end = usize::try_from(clip_end - start_sample)
+                        .map_err(|_| "clip timeline position is too large".to_owned())?;
+                    total_frames = total_frames.max(relative_end);
+                }
             }
         }
     }
@@ -899,6 +935,9 @@ fn render_project_buffer(
         for clip in &track.clips {
             let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
             if clip_end <= start_sample {
+                continue;
+            }
+            if end_sample.is_some_and(|end_sample| clip.start_sample >= end_sample) {
                 continue;
             }
             let media = project
@@ -947,9 +986,12 @@ fn render_project_buffer(
             } else {
                 0
             };
-            let remaining_clip_frames =
-                usize::try_from(clip_end - start_sample.max(clip.start_sample))
-                    .map_err(|_| "clip duration is too large".to_owned())?;
+            let render_clip_end =
+                end_sample.map_or(clip_end, |end_sample| clip_end.min(end_sample));
+            let remaining_clip_frames = usize::try_from(
+                render_clip_end.saturating_sub(start_sample.max(clip.start_sample)),
+            )
+            .map_err(|_| "clip duration is too large".to_owned())?;
             let mut limited = slice_buffer_frames(&decoded, source_start, remaining_clip_frames);
             let clip_offset = start_sample
                 .max(clip.start_sample)
@@ -1011,6 +1053,7 @@ fn print_help() {
     println!("  daw clip name <path> <clip-id> <name-or-clear>");
     println!("  daw clip remove <path> <clip-id>");
     println!("  daw marker add <path> <sample> <name>");
+    println!("  daw marker set <path> <marker-id> <sample> <name>");
     println!("  daw marker remove <path> <marker-id>");
     println!("  daw marker list <path>");
     println!("  daw snapshot create <path> [message]");
@@ -1032,7 +1075,7 @@ fn print_help() {
     println!("  daw media waveforms <path> [points]");
     println!("  daw render-test-tone <output> [duration-seconds]");
     println!("  daw render-metronome <output> <tempo-bpm> [bars] [beats-per-bar]");
-    println!("  daw render-project <path> <output> [duration-seconds] [start-sample]");
+    println!("  daw render-project <path> <output> [duration-seconds] [start-sample] [end-sample]");
     println!("  daw play-test-tone [duration-seconds]");
     println!("  daw play-metronome <tempo-bpm> [bars] [beats-per-bar]");
     println!("  daw play-project <path> [minimum-duration-seconds] [start-sample]");

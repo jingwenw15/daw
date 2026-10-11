@@ -252,6 +252,15 @@ pub enum ProjectCommand {
         /// Marker to remove.
         marker_id: StableId,
     },
+    /// Move or rename a project marker.
+    SetMarker {
+        /// Marker to update.
+        marker_id: StableId,
+        /// New timeline position in samples.
+        sample: u64,
+        /// New human-readable marker label.
+        name: String,
+    },
     /// Replace current state with a stored snapshot.
     CheckoutSnapshot {
         /// Snapshot identifier to restore.
@@ -634,6 +643,11 @@ impl ProjectCommand {
                 format!("add marker '{}' at {}", marker.name, marker.sample)
             }
             Self::RemoveMarker { marker_id } => format!("remove marker {marker_id}"),
+            Self::SetMarker {
+                marker_id,
+                sample,
+                name,
+            } => format!("set marker {marker_id} '{name}' at {sample}"),
             Self::CheckoutSnapshot { snapshot_id } => {
                 format!("checkout snapshot {snapshot_id}")
             }
@@ -1364,6 +1378,34 @@ pub fn remove_marker(project_dir: &Path, marker_id: &StableId) -> Result<Marker,
     Ok(removed)
 }
 
+/// Move or rename a timeline marker through the command log.
+///
+/// # Errors
+///
+/// Returns an error if the project cannot be loaded, the marker is unknown, or
+/// the updated marker state is invalid.
+pub fn set_marker(
+    project_dir: &Path,
+    marker_id: &StableId,
+    sample: u64,
+    name: &str,
+) -> Result<Marker, ProjectIoError> {
+    append_and_apply(
+        project_dir,
+        ProjectCommand::SetMarker {
+            marker_id: marker_id.clone(),
+            sample,
+            name: name.to_owned(),
+        },
+    )?;
+    let project = load_project(project_dir)?;
+    project
+        .markers
+        .into_iter()
+        .find(|marker| marker.id == *marker_id)
+        .ok_or_else(|| unknown_marker_error(marker_id))
+}
+
 /// Create a branch from the current project state.
 ///
 /// # Errors
@@ -1685,6 +1727,11 @@ fn apply_command(
         ),
         ProjectCommand::AddMarker { marker } => apply_add_marker(project, marker),
         ProjectCommand::RemoveMarker { marker_id } => apply_remove_marker(project, marker_id),
+        ProjectCommand::SetMarker {
+            marker_id,
+            sample,
+            name,
+        } => apply_set_marker(project, marker_id, *sample, name),
         ProjectCommand::CheckoutSnapshot { snapshot_id } => {
             Ok(load_snapshot(project_dir, snapshot_id)?.project)
         }
@@ -1932,6 +1979,23 @@ fn apply_remove_marker(
     validate_project_state(project)
 }
 
+fn apply_set_marker(
+    mut project: Project,
+    marker_id: &StableId,
+    sample: u64,
+    name: &str,
+) -> Result<Project, ProjectIoError> {
+    let marker = project
+        .markers
+        .iter_mut()
+        .find(|marker| marker.id == *marker_id)
+        .ok_or_else(|| unknown_marker_error(marker_id))?;
+    marker.sample = sample;
+    name.clone_into(&mut marker.name);
+    project.markers.sort_by_key(|marker| marker.sample);
+    validate_project_state(project)
+}
+
 fn validate_project_state(project: Project) -> Result<Project, ProjectIoError> {
     let errors = project.validate();
     if errors.is_empty() {
@@ -2153,7 +2217,7 @@ mod tests {
         create_snapshot, diff, duplicate_clip, init_project, list_branches, load_project,
         merge_branch, project_file_path, redo_project, remove_clip, remove_marker, remove_track,
         replay_project, set_clip_fades, set_clip_gain, set_clip_name, set_clip_placement,
-        set_clip_placement_on_track, set_clip_timing_on_track, set_project_tempo,
+        set_clip_placement_on_track, set_clip_timing_on_track, set_marker, set_project_tempo,
         set_track_controls, set_track_name, split_clip, switch_branch, undo_project, Project,
         ProjectIoError, StableId, Track, DEFAULT_TEMPO_BPM, PROJECT_SCHEMA_VERSION,
     };
@@ -2553,6 +2617,24 @@ mod tests {
         let replayed = replay_project(&project_dir).expect("replay project");
 
         assert_eq!(project.markers, vec![bridge]);
+        assert_eq!(replayed, project);
+
+        fs::remove_dir_all(project_dir).expect("cleanup project");
+    }
+
+    #[test]
+    fn moves_and_renames_marker_through_command_log() {
+        let project_dir = temp_project_dir("marker-edit");
+        init_project(&project_dir, "Marker Edit").expect("init project");
+        let marker = add_marker(&project_dir, 24_000, "Old").expect("add marker");
+
+        let edited = set_marker(&project_dir, &marker.id, 48_000, "Verse").expect("edit marker");
+        let project = load_project(&project_dir).expect("load project");
+        let replayed = replay_project(&project_dir).expect("replay project");
+
+        assert_eq!(edited.sample, 48_000);
+        assert_eq!(edited.name, "Verse");
+        assert_eq!(project.markers, vec![edited]);
         assert_eq!(replayed, project);
 
         fs::remove_dir_all(project_dir).expect("cleanup project");

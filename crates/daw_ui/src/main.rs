@@ -412,6 +412,15 @@ impl DawApp {
                 if ui.button("Add Marker").clicked() {
                     self.add_marker_at_playhead();
                 }
+                if ui.button("Prev Marker").clicked() {
+                    self.seek_previous_marker();
+                }
+                if ui.button("Next Marker").clicked() {
+                    self.seek_next_marker();
+                }
+                if ui.button("Loop Markers").clicked() {
+                    self.set_loop_from_surrounding_markers();
+                }
                 ui.add_sized(
                     [210.0, 24.0],
                     egui::TextEdit::singleline(&mut self.export_path),
@@ -1473,6 +1482,28 @@ impl DawApp {
             self.paste_clips_at_playhead();
             return;
         }
+        let marker_pressed = ctx.input(|input| {
+            !input.modifiers.command
+                && !input.modifiers.shift
+                && !input.modifiers.alt
+                && !input.modifiers.ctrl
+                && input.key_pressed(egui::Key::M)
+        });
+        if marker_pressed && !ctx.wants_keyboard_input() && self.project.is_some() {
+            self.add_marker_at_playhead();
+            return;
+        }
+        let marker_loop_pressed = ctx.input(|input| {
+            !input.modifiers.command
+                && !input.modifiers.shift
+                && !input.modifiers.alt
+                && !input.modifiers.ctrl
+                && input.key_pressed(egui::Key::L)
+        });
+        if marker_loop_pressed && !ctx.wants_keyboard_input() && self.project.is_some() {
+            self.set_loop_from_surrounding_markers();
+            return;
+        }
         let split_pressed = ctx.input(|input| {
             !input.modifiers.command
                 && !input.modifiers.shift
@@ -1907,16 +1938,115 @@ impl DawApp {
         }
     }
 
-    fn export_project_mix(&mut self) {
-        let path = PathBuf::from(&self.project_path);
-        let start_sample = match parse_u64(&self.playhead_sample, "playhead") {
+    fn seek_previous_marker(&mut self) {
+        let Some(project) = &self.project else {
+            "Open a project before navigating markers".clone_into(&mut self.status);
+            return;
+        };
+        let playhead = match parse_u64(&self.playhead_sample, "playhead") {
             Ok(value) => value,
             Err(error) => {
                 self.status = error;
                 return;
             }
         };
-        match render_project_buffer(&path, 1.0, start_sample, None, self.metronome_enabled)
+        let Some(marker) = project
+            .markers
+            .iter()
+            .rev()
+            .find(|marker| marker.sample < playhead)
+            .or_else(|| project.markers.last())
+        else {
+            "Project has no markers".clone_into(&mut self.status);
+            return;
+        };
+        self.playhead_sample = marker.sample.to_string();
+        self.recording_start_sample = self.playhead_sample.clone();
+        self.status = format!("Moved to marker '{}'", marker.name);
+    }
+
+    fn seek_next_marker(&mut self) {
+        let Some(project) = &self.project else {
+            "Open a project before navigating markers".clone_into(&mut self.status);
+            return;
+        };
+        let playhead = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let Some(marker) = project
+            .markers
+            .iter()
+            .find(|marker| marker.sample > playhead)
+            .or_else(|| project.markers.first())
+        else {
+            "Project has no markers".clone_into(&mut self.status);
+            return;
+        };
+        self.playhead_sample = marker.sample.to_string();
+        self.recording_start_sample = self.playhead_sample.clone();
+        self.status = format!("Moved to marker '{}'", marker.name);
+    }
+
+    fn set_loop_from_surrounding_markers(&mut self) {
+        let Some(project) = &self.project else {
+            "Open a project before setting a marker loop".clone_into(&mut self.status);
+            return;
+        };
+        let playhead = match parse_u64(&self.playhead_sample, "playhead") {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let previous = project
+            .markers
+            .iter()
+            .rev()
+            .find(|marker| marker.sample <= playhead);
+        let next = project
+            .markers
+            .iter()
+            .find(|marker| marker.sample > playhead);
+        let Some((start, end)) = previous
+            .zip(next)
+            .map(|(start, end)| (start.sample, end.sample))
+        else {
+            "Need markers before and after the playhead".clone_into(&mut self.status);
+            return;
+        };
+        self.loop_enabled = true;
+        self.loop_start_sample = start.to_string();
+        self.loop_end_sample = end.to_string();
+        self.status = format!("Loop set from marker span {start} to {end}");
+    }
+
+    fn export_project_mix(&mut self) {
+        let path = PathBuf::from(&self.project_path);
+        let loop_region = match self.loop_region() {
+            Ok(loop_region) => loop_region,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let start_sample = if let Some(region) = loop_region {
+            region.start_sample
+        } else {
+            match parse_u64(&self.playhead_sample, "playhead") {
+                Ok(value) => value,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            }
+        };
+        let end_sample = loop_region.map(|region| region.end_sample);
+        match render_project_buffer(&path, 1.0, start_sample, end_sample, self.metronome_enabled)
             .and_then(|buffer| {
                 daw_engine::write_wav(Path::new(&self.export_path), &buffer)
                     .map_err(|error| format!("Export failed: {error}"))
